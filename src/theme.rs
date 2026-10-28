@@ -1,0 +1,70 @@
+//! Xcode-like dark palette. Chrome colors live here; the component theme is
+//! tuned to match so editor, inputs and buttons blend in.
+
+use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::{App, Hsla, px, rgb};
+
+pub fn c(hex: u32) -> Hsla {
+    rgb(hex).into()
+}
+
+pub fn ca(hex: u32, alpha: f32) -> Hsla {
+    let mut color = c(hex);
+    color.a = alpha;
+    color
+}
+
+pub struct Palette;
+
+impl Palette {
+    pub fn editor_bg() -> Hsla { c(0x1f1f24) }
+    pub fn toolbar_bg() -> Hsla { c(0x2b2b30) }
+    pub fn sidebar_bg() -> Hsla { c(0x26262b) }
+    pub fn panel_bg() -> Hsla { c(0x1b1b1f) }
+    pub fn border() -> Hsla { c(0x0f0f12) }
+    pub fn hairline() -> Hsla { c(0x38383d) }
+    pub fn text() -> Hsla { c(0xdfdfe0) }
+    pub fn muted() -> Hsla { c(0x8e8e93) }
+    pub fn faint() -> Hsla { c(0x5c5c61) }
+    pub fn accent() -> Hsla { c(0x0a84ff) }
+    pub fn row_selected() -> Hsla { ca(0x0a84ff, 0.32) }
+    pub fn row_hover() -> Hsla { ca(0xffffff, 0.05) }
+    pub fn tab_active() -> Hsla { c(0x1f1f24) }
+    pub fn tab_inactive() -> Hsla { c(0x26262b) }
+    pub fn git_modified() -> Hsla { c(0xd9a54a) }
+    pub fn git_added() -> Hsla { c(0x5fc27a) }
+    pub fn git_deleted() -> Hsla { c(0xff6b6b) }
+    pub fn git_untracked() -> Hsla { c(0x6aa9ff) }
+    pub fn folder() -> Hsla { c(0x6aa9ff) }
+}
+
+pub const MONO_FONT: &str = "Menlo";
+pub const UI_FONT_SIZE: f32 = 13.;
+pub const MONO_FONT_SIZE: f32 = 13.;
+
+pub fn apply(cx: &mut App) {
+    Theme::change(ThemeMode::Dark, None, cx);
+    let theme = Theme::global_mut(cx);
+    theme.mono_font_family = MONO_FONT.into();
+    theme.mono_font_size = px(MONO_FONT_SIZE);
+    theme.font_size = px(UI_FONT_SIZE);
+    theme.background = Palette::editor_bg();
+    theme.foreground = Palette::text();
+    theme.border = Palette::hairline();
+    theme.input = Palette::hairline();
+    theme.muted_foreground = Palette::muted();
+    theme.primary = Palette::accent();
+    theme.primary_hover = c(0x2a95ff);
+    theme.primary_active = c(0x0070e0);
+    theme.primary_foreground = c(0xffffff);
+    theme.selection = ca(0x0a84ff, 0.35);
+    theme.caret = c(0xffffff);
+    theme.popover = c(0x2b2b30);
+    theme.list_active = Palette::row_selected();
+    theme.list_hover = Palette::row_hover();
+    theme.scrollbar = gpui_kit::transparent_black();
+    theme.scrollbar_thumb = ca(0xffffff, 0.18);
+    theme.scrollbar_thumb_hover = ca(0xffffff, 0.3);
+    theme.title_bar = Palette::toolbar_bg();
+    theme.title_bar_border = Palette::border();
+}

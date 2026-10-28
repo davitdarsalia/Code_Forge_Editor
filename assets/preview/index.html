@@ -1,0 +1,308 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: #1b1b1f;
+    color: #dfdfe0;
+    font: 12px -apple-system, BlinkMacSystemFont, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  #label {
+    flex: none;
+    padding: 10px 14px 0;
+    color: #8e8e93;
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  #label b { color: #dfdfe0; font-weight: 600; }
+  #label .stubs { color: #d9a54a; overflow: hidden; text-overflow: ellipsis; }
+  #stage {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 18px;
+  }
+  /* iPhone 15-sized screen in a bezel, scaled to fit the pane. */
+  #device {
+    flex: none;
+    width: 393px;
+    height: 852px;
+    padding: 12px;
+    border-radius: 56px;
+    background: #0b0b0d;
+    box-shadow: 0 0 0 1px #3a3a3f, 0 18px 40px rgba(0, 0, 0, 0.55);
+    transform-origin: top center;
+  }
+  #screen {
+    width: 100%;
+    height: 100%;
+    border-radius: 44px;
+    overflow: hidden;
+    background: #fff;
+    color: #111;
+    position: relative;
+  }
+  #root { position: absolute; inset: 0; display: flex; flex-direction: column; }
+  #root > * { flex: 1; }
+  #message {
+    margin: 18px;
+    padding: 12px 14px;
+    border-radius: 8px;
+    white-space: pre-wrap;
+    font: 12px Menlo, monospace;
+    line-height: 1.45;
+  }
+  #message.error { background: rgba(255, 107, 107, 0.12); color: #ff8b8b; border: 1px solid rgba(255, 107, 107, 0.35); }
+  #message.info { background: rgba(255, 255, 255, 0.05); color: #8e8e93; }
+  .forge-stub {
+    display: inline-block;
+    border: 1px dashed #d9a54a;
+    border-radius: 4px;
+    padding: 2px 6px;
+    color: #9a6b12;
+    background: rgba(217, 165, 74, 0.08);
+    font: 11px Menlo, monospace;
+  }
+</style>
+<script>
+(function () {
+  var pending = null;
+  var ready = false;
+  var root = null;
+  var stubbed = [];
+
+  window.forgeUpdate = function (source, filename) {
+    pending = { source: source, filename: filename };
+    if (ready) run();
+  };
+
+  window.__forgeReady = function () {
+    if (!window.React || !window.ReactDOM || !window.ReactNative || !window.Babel) return;
+    ready = true;
+    if (pending) run();
+  };
+
+  window.__forgeLoadFailed = function (what) {
+    showMessage('error', 'Could not load ' + what + '.\nThe preview needs a network connection for now.');
+  };
+
+  window.addEventListener('error', function (event) {
+    showMessage('error', String(event.error && event.error.stack || event.message));
+  });
+
+  function el(id) { return document.getElementById(id); }
+
+  function showMessage(kind, text) {
+    var box = el('message');
+    if (!box) return;
+    box.className = kind;
+    box.textContent = text;
+    box.hidden = false;
+  }
+
+  function clearMessage() { el('message').hidden = true; }
+
+  function setLabel(name, filename) {
+    var label = el('label');
+    label.textContent = '';
+    var b = document.createElement('b');
+    b.textContent = name || 'Preview';
+    label.appendChild(b);
+    label.appendChild(document.createTextNode(filename));
+    if (stubbed.length) {
+      var s = document.createElement('span');
+      s.className = 'stubs';
+      s.textContent = 'stubbed: ' + stubbed.join(', ');
+      label.appendChild(s);
+    }
+  }
+
+  // Imports other than React resolve to labeled placeholders for now.
+  function stubComponent(label) {
+    var Stub = function (props) {
+      return React.createElement('span', { className: 'forge-stub' }, '<' + label + '>', props && props.children);
+    };
+    Stub.displayName = label;
+    return Stub;
+  }
+
+  function stubModule(id) {
+    if (stubbed.indexOf(id) < 0) stubbed.push(id);
+    var base = id.split('/').pop().replace(/\.\w+$/, '') || id;
+    var cache = {};
+    return new Proxy({}, {
+      get: function (_, key) {
+        if (key === '__esModule') return true;
+        if (typeof key !== 'string') return undefined;
+        var label = key === 'default' ? base : key;
+        return cache[key] || (cache[key] = stubComponent(label));
+      }
+    });
+  }
+
+  function forgeRequire(id) {
+    if (id === 'react') return React;
+    if (id === 'react-native' || id === 'react-native-web') return ReactNative;
+    if (id === 'react-dom' || id === 'react-dom/client') return ReactDOM;
+    if (/\.(css|scss|sass|less)$/.test(id)) return {};
+    return stubModule(id);
+  }
+
+  function isComponent(value) {
+    return typeof value === 'function' || (value && typeof value === 'object' && value.$$typeof);
+  }
+
+  var DECLARATION = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*|class\s+|(?:const|let|var)\s+)([A-Z][A-Za-z0-9_$]*)/gm;
+
+  function declaredNames(source) {
+    var names = [];
+    var match;
+    DECLARATION.lastIndex = 0;
+    while ((match = DECLARATION.exec(source))) {
+      if (names.indexOf(match[1]) < 0) names.push(match[1]);
+    }
+    return names;
+  }
+
+  // Order: default export, `Preview`, other exports, last declared component.
+  function pick(exports, declared) {
+    var candidates = [['default', exports.default], ['Preview', exports.Preview], ['Preview', declared.Preview]];
+    Object.keys(exports).forEach(function (key) {
+      if (/^[A-Z]/.test(key)) candidates.push([key, exports[key]]);
+    });
+    Object.keys(declared).reverse().forEach(function (key) { candidates.push([key, declared[key]]); });
+    for (var i = 0; i < candidates.length; i++) {
+      var value = candidates[i][1];
+      if (React.isValidElement(value)) return { name: candidates[i][0], element: value };
+      if (isComponent(value)) {
+        var name = value.displayName || value.name || candidates[i][0];
+        return { name: name === 'default' ? 'Component' : name, element: React.createElement(value) };
+      }
+    }
+    return null;
+  }
+
+  var DEVICE = { width: 393 + 24, height: 852 + 24 };
+  function fit() {
+    var stage = el('stage');
+    var room = { width: stage.clientWidth - 36, height: stage.clientHeight - 36 };
+    var scale = Math.min(1, room.width / DEVICE.width, room.height / DEVICE.height);
+    el('device').style.transform = 'scale(' + Math.max(scale, 0.2) + ')';
+  }
+  window.addEventListener('resize', function () { if (ready) fit(); });
+
+  var Boundary = null;
+  function makeBoundary() {
+    function B(props) {
+      React.Component.call(this, props);
+      this.state = { error: null };
+    }
+    B.prototype = Object.create(React.Component.prototype);
+    B.prototype.constructor = B;
+    B.getDerivedStateFromError = function (error) { return { error: error }; };
+    B.prototype.componentDidCatch = function (error) {
+      showMessage('error', String(error && error.stack || error));
+    };
+    B.prototype.render = function () { return this.state.error ? null : this.props.children; };
+    return B;
+  }
+
+  function run() {
+    var job = pending;
+    var filename = job.filename;
+    stubbed = [];
+    fit();
+    Boundary = Boundary || makeBoundary();
+    var names = declaredNames(job.source);
+    var collect = '\n;__forgeCollect({' + names.map(function (n) {
+      return JSON.stringify(n) + ': typeof ' + n + " !== 'undefined' ? " + n + ' : undefined';
+    }).join(', ') + '});\n';
+
+    var code;
+    try {
+      var presets = [['react', { runtime: 'classic' }]];
+      if (/\.tsx$/i.test(filename)) presets.push(['typescript', { isTSX: true, allExtensions: true }]);
+      code = Babel.transform(job.source + collect, {
+        filename: filename,
+        presets: presets,
+        plugins: ['transform-modules-commonjs'],
+        sourceType: 'module'
+      }).code;
+    } catch (error) {
+      setLabel('Syntax error', filename);
+      showMessage('error', String(error.message || error));
+      return;
+    }
+
+    var module = { exports: {} };
+    var declared = {};
+    window.__forgeCollect = function (found) { declared = found; };
+    try {
+      new Function('require', 'module', 'exports', 'React', code)(forgeRequire, module, module.exports, React);
+    } catch (error) {
+      setLabel('Runtime error', filename);
+      showMessage('error', String(error && error.stack || error));
+      return;
+    }
+
+    var found = pick(module.exports, declared);
+    setLabel(found && found.name, filename);
+    if (!found) {
+      if (root) root.render(null);
+      showMessage('info', 'No component found.\nExport one, e.g. `export default function App() { … }`,\nor name it `Preview`.');
+      return;
+    }
+    clearMessage();
+    root = root || ReactDOM.createRoot(el('root'));
+    // A fresh key resets the error boundary on every edit.
+    root.render(React.createElement(Boundary, { key: Date.now() }, found.element));
+  }
+})();
+/*FORGE_INITIAL*/
+</script>
+</head>
+<body>
+<div id="label"></div>
+<pre id="message" class="info">Loading React Native Web and Babel…</pre>
+<div id="stage"><div id="device"><div id="screen"><div id="root"></div></div></div></div>
+<!-- Pinned deps make esm.sh resolve one shared React instance. -->
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?deps=react@18.3.1",
+    "react-native-web": "https://esm.sh/react-native-web@0.19.13?deps=react@18.3.1,react-dom@18.3.1"
+  }
+}
+</script>
+<script src="https://unpkg.com/@babel/standalone@7.26.0/babel.min.js" onerror="__forgeLoadFailed('Babel')"></script>
+<!-- Module scripts run after classic ones, so Babel is loaded by now. -->
+<script type="module">
+  try {
+    const [react, client, native] = await Promise.all([
+      import('react'),
+      import('react-dom/client'),
+      import('react-native-web'),
+    ]);
+    window.React = react.default || react;
+    window.ReactDOM = client.default || client;
+    window.ReactNative = native;
+  } catch (error) {
+    __forgeLoadFailed('React Native Web (' + error.message + ')');
+  }
+  __forgeReady();
+</script>
+</body>
+</html>
