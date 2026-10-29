@@ -1900,6 +1900,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "libc",
+ "lsp-types",
  "nucleo-matcher",
  "num_cpus",
  "portable-pty",

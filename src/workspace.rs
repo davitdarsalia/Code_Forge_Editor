@@ -1,6 +1,7 @@
 //! The single window: toolbar, navigator (left), editor tabs (center),
 //! inspector (right), terminal (bottom) and status bar.
 
+use std::cell::Cell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -8,7 +9,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Editor, EditorState, Escape, Input, InputEvent, InputState, Position};
+use gpui_kit::component::input::{
+    DefinitionProvider as _, Editor, EditorState, Escape, Input, InputEvent, InputState, Position, RopeExt as _,
+    ShowDocumentHandler,
+};
 use gpui_kit::base::{Spring, spring};
 use gpui_kit::component::Icon;
 use gpui_kit::{
@@ -27,6 +31,7 @@ use crate::preview::{self, Preview};
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::recent;
 use crate::index_cache;
+use crate::lsp;
 use crate::search::{FileIndex, IndexProgress};
 use crate::settings::Settings;
 use crate::search_panel::{SearchEvent, SearchPanel};
@@ -47,6 +52,8 @@ const INDEX_TICK: Duration = Duration::from_millis(80);
 /// Short walks finish before this and never flash a progress bar.
 const INDEX_BAR_DELAY: Duration = Duration::from_millis(120);
 const MAX_LOG_LINES: usize = 200;
+/// Places Go Back (⌃⌘←) can return to.
+const MAX_HISTORY: usize = 100;
 
 struct Indexing {
     progress: Arc<IndexProgress>,
@@ -85,7 +92,16 @@ struct Document {
     /// Autosave found the file changed on disk and left it alone; reported once.
     conflict: bool,
     save_task: Option<Task<()>>,
+    /// Go to Definition for languages with a server (see `lsp.rs`).
+    definitions: Option<Rc<lsp::Definitions>>,
     _subscription: Subscription,
+}
+
+/// A cursor place for Go Back / Go Forward.
+#[derive(Clone, PartialEq)]
+struct NavPoint {
+    path: PathBuf,
+    position: Position,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -165,6 +181,10 @@ pub struct Workspace {
     tree_scroll: UniformListScrollHandle,
     /// Soft-wrap value last pushed to the open editors (see `sync_settings`).
     soft_wrap: bool,
+    lsp: Rc<lsp::Manager>,
+    definition_task: Option<Task<()>>,
+    back: Vec<NavPoint>,
+    forward: Vec<NavPoint>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -333,6 +353,10 @@ impl Workspace {
             focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
             soft_wrap: Settings::get(cx).soft_wrap,
+            lsp: Rc::default(),
+            definition_task: None,
+            back: Vec::new(),
+            forward: Vec::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -369,6 +393,9 @@ impl Workspace {
         }
         self.docs.clear();
         self.active = None;
+        self.back.clear();
+        self.forward.clear();
+        self.lsp.set_project(Some(root.clone()));
         self.repo = None;
         self.git_marks = Rc::default();
         self.terminal = None;
@@ -612,18 +639,36 @@ impl Workspace {
         };
         let saved_hash = hash_text(&text);
         let language = files::detect_language(path, &text);
+        let definitions = lsp::Kind::for_language(language).map(|kind| {
+            Rc::new(lsp::Definitions {
+                manager: Rc::downgrade(&self.lsp),
+                kind,
+                path: path.to_path_buf(),
+                stale: Rc::new(Cell::new(false)),
+            })
+        });
+        let show_document = self.show_document_handler(cx);
         let editor = cx.new(|cx| {
-            EditorState::new(window, cx)
+            let mut state = EditorState::new(window, cx)
                 .language(language)
                 .line_number(true)
                 .folding(true)
                 .soft_wrap(self.soft_wrap)
-                .default_value(text)
+                .default_value(text);
+            if let Some(definitions) = definitions.clone() {
+                let lsp = state.lsp_mut();
+                lsp.definition_provider = Some(definitions);
+                lsp.show_document = Some(show_document);
+            }
+            state
         });
         let id = self.next_doc_id;
         self.next_doc_id += 1;
         let subscription = cx.subscribe_in(&editor, window, move |this, _, event, window, cx| match event {
             InputEvent::Change => {
+                if let Some(definitions) = this.docs.iter().find(|d| d.id == id).and_then(|d| d.definitions.as_ref()) {
+                    definitions.stale.set(true);
+                }
                 this.schedule_save(id, cx);
                 this.schedule_preview(id, window, cx);
             }
@@ -641,6 +686,7 @@ impl Workspace {
             mtime: mtime(path),
             conflict: false,
             save_task: None,
+            definitions,
             _subscription: subscription,
         });
         if let Some(tree) = self.tree.as_mut() {
@@ -649,6 +695,124 @@ impl Workspace {
         }
         let ix = self.docs.len() - 1;
         self.activate(ix, window, cx);
+    }
+
+    // ---- Go to Definition, Go Back / Forward ------------------------------
+
+    /// Where the editor sends ⌘-click and its context menu's Go to Definition.
+    /// Deferred: the editor that asks is mid-update, and the target may be
+    /// that same editor.
+    fn show_document_handler(&self, cx: &mut Context<Self>) -> ShowDocumentHandler {
+        let workspace = cx.weak_entity();
+        Rc::new(move |params, window, cx| {
+            let Some(path) = lsp::uri_to_path(params.uri.as_str()) else { return false };
+            let start = params.selection.map(|range| range.start).unwrap_or_default();
+            let workspace = workspace.clone();
+            window.defer(cx, move |window, cx| {
+                let _ = workspace.update(cx, |ws, cx| ws.jump_to(&path, start, window, cx));
+            });
+            true
+        })
+    }
+
+    fn nav_point(&self, cx: &App) -> Option<NavPoint> {
+        let doc = self.active_doc()?;
+        let state = doc.editor.read(cx);
+        Some(NavPoint { path: doc.path.clone(), position: state.text().offset_to_position(state.cursor()) })
+    }
+
+    fn push_history(stack: &mut Vec<NavPoint>, point: NavPoint) {
+        if stack.last() != Some(&point) {
+            stack.push(point);
+            if stack.len() > MAX_HISTORY {
+                stack.remove(0);
+            }
+        }
+    }
+
+    /// Opens a server-reported location (`lsp_start` in UTF-16 columns).
+    fn jump_to(&mut self, path: &Path, lsp_start: Position, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.nav_point(cx);
+        if !self.open_navigated(path, window, cx) {
+            return;
+        }
+        let Some(doc) = self.active_doc() else { return };
+        let position = {
+            let text = doc.editor.read(cx).text();
+            let line = if (lsp_start.line as usize) < text.lines_len() {
+                text.slice_line(lsp_start.line as usize).to_string()
+            } else {
+                String::new()
+            };
+            Position { line: lsp_start.line, character: lsp::char_column(&line, lsp_start.character) }
+        };
+        doc.editor.update(cx, |state, cx| state.set_cursor_position(position, window, cx));
+        if let Some(from) = from {
+            Self::push_history(&mut self.back, from);
+            self.forward.clear();
+        }
+    }
+
+    /// Opens `path` for navigation; files outside the project (std sources,
+    /// generated interfaces) open read-only so autosave never touches them.
+    fn open_navigated(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.open_file(path, window, cx);
+        let Some(doc) = self.active_doc().filter(|doc| doc.path == path) else { return false };
+        if self.lsp.is_external(path) {
+            doc.editor.update(cx, |state, cx| state.set_readonly(true, cx));
+        }
+        true
+    }
+
+    /// ⌃⌘J: the definition of the symbol at the cursor.
+    pub fn go_to_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = self.active_doc() else { return };
+        let Some(definitions) = doc.definitions.clone() else {
+            self.notify_info("Go to Definition works in Swift and Rust files", cx);
+            return;
+        };
+        let (text, offset) = {
+            let state = doc.editor.read(cx);
+            (state.text().clone(), state.cursor())
+        };
+        let request = definitions.definitions(&text, offset, window, cx);
+        let kind = definitions.kind;
+        let indexing = format!("{} is still indexing the project; try again shortly", kind.server_name());
+        self.definition_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = request.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.definition_task = None;
+                match result {
+                    Ok(links) => {
+                        let target = links
+                            .first()
+                            .and_then(|link| Some((lsp::uri_to_path(link.target_uri.as_str())?, link.target_selection_range.start)));
+                        match target {
+                            Some((path, start)) => this.jump_to(&path, start, window, cx),
+                            None if this.lsp.indexing(kind) => this.notify_info(indexing, cx),
+                            None => this.notify_info("No definition found", cx),
+                        }
+                    }
+                    Err(err) if matches!(err.downcast_ref(), Some(lsp::ServerError::Busy)) => this.notify_info(indexing, cx),
+                    Err(err) => this.notify_error(err.to_string(), cx),
+                }
+            });
+        }));
+    }
+
+    /// ⌃⌘← / ⌃⌘→: back and forth along definition jumps.
+    pub fn step_history(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let target = if back { self.back.pop() } else { self.forward.pop() };
+        let Some(target) = target else { return };
+        if let Some(here) = self.nav_point(cx) {
+            Self::push_history(if back { &mut self.forward } else { &mut self.back }, here);
+        }
+        if !self.open_navigated(&target.path, window, cx) {
+            return;
+        }
+        if let Some(doc) = self.active_doc() {
+            doc.editor.update(cx, |state, cx| state.set_cursor_position(target.position, window, cx));
+        }
     }
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -688,7 +852,8 @@ impl Workspace {
 
     fn remove_doc(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.docs.iter().position(|d| d.id == id) else { return };
-        self.docs.remove(ix);
+        let doc = self.docs.remove(ix);
+        self.lsp.close(&doc.path);
         self.active = if self.docs.is_empty() { None } else { Some(ix.min(self.docs.len() - 1)) };
         if let Some(ix) = self.active {
             self.activate(ix, window, cx);

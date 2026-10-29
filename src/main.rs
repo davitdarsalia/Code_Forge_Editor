@@ -10,6 +10,7 @@ mod git;
 mod icons;
 mod index_cache;
 mod languages;
+mod lsp;
 mod preview;
 mod quick_open;
 mod recent;
@@ -65,6 +66,9 @@ actions!(
         NewFile,
         QuickOpenFile,
         FindInProject,
+        JumpToDefinition,
+        GoBack,
+        GoForward,
         FormatFile,
         GitPull,
         GitPush,
@@ -331,6 +335,10 @@ pub fn set_menus(cx: &mut App) {
         Menu::new("Navigate").items([
             MenuItem::action("Reveal in Navigator", RevealInNavigator),
             MenuItem::separator(),
+            MenuItem::action("Jump to Definition", JumpToDefinition),
+            MenuItem::action("Go Back", GoBack),
+            MenuItem::action("Go Forward", GoForward),
+            MenuItem::separator(),
             MenuItem::action("Show Next Tab", NextTab),
             MenuItem::action("Show Previous Tab", PreviousTab),
         ]),
@@ -452,6 +460,9 @@ fn register_actions(cx: &mut App) {
     cx.on_action(|_: &FindInProject, cx| {
         with_workspace(cx, |ws, window, cx| ws.show_search(window, cx))
     });
+    cx.on_action(|_: &JumpToDefinition, cx| with_workspace(cx, |ws, window, cx| ws.go_to_definition(window, cx)));
+    cx.on_action(|_: &GoBack, cx| with_workspace(cx, |ws, window, cx| ws.step_history(true, window, cx)));
+    cx.on_action(|_: &GoForward, cx| with_workspace(cx, |ws, window, cx| ws.step_history(false, window, cx)));
     cx.on_action(|_: &GitPull, cx| with_workspace(cx, |ws, window, cx| ws.run_remote("Pull", git::pull, window, cx)));
     cx.on_action(|_: &GitPush, cx| with_workspace(cx, |ws, window, cx| ws.run_remote("Push", git::push, window, cx)));
     cx.on_action(|_: &GitFetch, cx| with_workspace(cx, |ws, window, cx| ws.run_remote("Fetch", git::fetch, window, cx)));
@@ -512,6 +523,9 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-2", ShowSearchNavigator, None),
         KeyBinding::new("cmd-3", ShowChangesNavigator, None),
         KeyBinding::new("cmd-shift-j", RevealInNavigator, None),
+        KeyBinding::new("ctrl-cmd-j", JumpToDefinition, None),
+        KeyBinding::new("ctrl-cmd-left", GoBack, None),
+        KeyBinding::new("ctrl-cmd-right", GoForward, None),
         KeyBinding::new("cmd-r", ToggleInspector, None),
         KeyBinding::new("cmd-alt-0", ToggleInspector, None),
         KeyBinding::new("cmd-j", ToggleTerminal, None),

@@ -158,7 +158,7 @@ pub fn format(path: &Path, language: &str, text: &str) -> Outcome {
 
 // ---- Tool lookup ---------------------------------------------------------
 
-fn search_dirs() -> Vec<PathBuf> {
+pub(crate) fn search_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
@@ -170,7 +170,7 @@ fn search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn which(name: &str) -> Option<PathBuf> {
+pub(crate) fn which(name: &str) -> Option<PathBuf> {
     search_dirs().into_iter().map(|d| d.join(name)).find(|p| p.is_file())
 }
 

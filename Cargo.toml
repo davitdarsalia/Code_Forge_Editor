@@ -43,6 +43,8 @@ gpui-kit = { version = "0.8.1", features = [
     "tree-sitter-zig",
 ] }
 anyhow = "1"
+# Go to Definition types shared with the editor (same version as gpui-base).
+lsp-types = "0.97"
 # libgit2, vendored and without network features: status/index/commit run in-process.
 # Network ops stay on the git CLI (see git.rs).
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }

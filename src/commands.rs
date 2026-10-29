@@ -6,7 +6,7 @@ use gpui_kit::Action;
 
 use crate::{
     Build, ClearRecent, CleanBuild, CloneRepository, CloseTab, FindInProject, FocusCommit, FocusTerminal,
-    FormatFile, GitFetch, GitPull, GitPush, InstallBuild, Minimize, NewFile, NewTerminal, NewWindow, NextTab,
+    FormatFile, GitFetch, GoBack, GoForward, JumpToDefinition, GitPull, GitPush, InstallBuild, Minimize, NewFile, NewTerminal, NewWindow, NextTab,
     OpenFolder, OpenSettings, PreviousTab, QuickOpenFile, Quit, RevealInNavigator, SaveAll, SaveFile,
     ShowChangesNavigator, ShowFilesNavigator, ShowSearchNavigator, StopBuild, ToggleInspector, ToggleNavigator,
     TogglePreview, ToggleTerminal, Zoom,
@@ -46,6 +46,9 @@ pub const COMMANDS: &[Command] = &[
     // Find / Navigate
     Command { name: "Find in Project…", keys: "⇧⌘F", action: || Box::new(FindInProject) },
     Command { name: "Reveal in Navigator", keys: "⇧⌘J", action: || Box::new(RevealInNavigator) },
+    Command { name: "Jump to Definition", keys: "⌃⌘J", action: || Box::new(JumpToDefinition) },
+    Command { name: "Go Back", keys: "⌃⌘←", action: || Box::new(GoBack) },
+    Command { name: "Go Forward", keys: "⌃⌘→", action: || Box::new(GoForward) },
     Command { name: "Show Next Tab", keys: "⇧⌘]", action: || Box::new(NextTab) },
     Command { name: "Show Previous Tab", keys: "⇧⌘[", action: || Box::new(PreviousTab) },
     // Source Control
@@ -91,6 +94,8 @@ mod tests {
             "enter" => out.push('↩'),
             "tab" => out.push('⇥'),
             "escape" => out.push('⎋'),
+            "left" => out.push('←'),
+            "right" => out.push('→'),
             key => out.push_str(&key.to_uppercase()),
         }
         out
