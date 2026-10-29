@@ -340,7 +340,7 @@ impl Workspace {
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let saved_hash = hash_text(&text);
-        let language = files::language_for(path);
+        let language = files::detect_language(path, &text);
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language(language)

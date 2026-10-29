@@ -62,7 +62,12 @@ tree-sitter-properties = "0.3"
 tree-sitter-objc = "3"
 tree-sitter-ini = "1"
 tree-sitter-dart = "0.3"
+tree-sitter-batch = "0.11"
+tree-sitter-language = "0.1"
 wry = { version = "0.57.1", default-features = false, features = ["os-webview"] }
+
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 opt-level = 3

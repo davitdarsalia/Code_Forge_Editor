@@ -156,6 +156,9 @@ pub fn language_for(path: &Path) -> &'static str {
         "gemfile" | "podfile" | "fastfile" | "appfile" | "matchfile" | "rakefile" | "brewfile"
         | "dangerfile" | "vagrantfile" => return "ruby",
         "jenkinsfile" => return "groovy",
+        "gradlew" => return "bash",
+        ".gitignore" | ".dockerignore" | ".npmignore" | ".slugignore" | ".gcloudignore" => return "gitignore",
+        ".gitmodules" => return "ini",
         _ => {}
     }
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -165,10 +168,15 @@ pub fn language_for(path: &Path) -> &'static str {
         "kt" | "kts" => "kotlin",
         "java" => "java",
         "gradle" | "groovy" | "gvy" => "groovy",
-        "xml" | "plist" | "xib" | "storyboard" | "entitlements" | "xcscheme" | "svg" | "csproj" => "xml",
-        "properties" | "pro" => "properties",
-        "rb" | "rake" | "gemspec" | "podspec" | "ru" => "ruby",
-        "erb" => "erb",
+        "xml" | "plist" | "xib" | "storyboard" | "entitlements" | "xcscheme" | "svg" | "csproj"
+        | "stringsdict" | "xcworkspacedata" | "xcbkptlist" | "xcsettings" | "xcprivacy" | "iml" => "xml",
+        "pbxproj" | "strings" => "openstep_plist",
+        "xcconfig" => "xcconfig",
+        "properties" => "properties",
+        "pro" => "proguard",
+        "bat" | "cmd" => "batch",
+        "rb" | "rake" | "gemspec" | "podspec" | "ru" | "rbi" | "rbs" => "ruby",
+        "erb" | "rhtml" => "erb",
         "dart" => "dart",
         "m" | "mm" => "objc",
         "js" | "mjs" | "cjs" | "jsx" => "javascript",
@@ -176,7 +184,7 @@ pub fn language_for(path: &Path) -> &'static str {
         "tsx" => "tsx",
         "py" | "pyi" => "python",
         "go" => "go",
-        "json" | "jsonc" | "json5" | "resolved" => "json",
+        "json" | "jsonc" | "json5" | "resolved" | "xcstrings" => "json",
         "toml" => "toml",
         "yml" | "yaml" => "yaml",
         "md" | "mdx" | "markdown" => "markdown",
@@ -204,6 +212,34 @@ pub fn language_for(path: &Path) -> &'static str {
     }
 }
 
+/// `language_for`, falling back to the `#!` line for extensionless scripts
+/// (fastlane's `run`, `gradlew`-style wrappers).
+pub fn detect_language(path: &Path, text: &str) -> &'static str {
+    let language = language_for(path);
+    if language != "text" {
+        return language;
+    }
+    let first = text.lines().next().unwrap_or_default();
+    let Some(shebang) = first.strip_prefix("#!") else { return language };
+    // `#!/usr/bin/env ruby` names the interpreter last; `#!/bin/bash -e` first.
+    let mut words = shebang.split_whitespace();
+    let program = words.next().unwrap_or_default();
+    let program = if program.ends_with("/env") { words.find(|w| !w.starts_with('-')).unwrap_or_default() } else { program };
+    let interpreter = program.rsplit('/').next().unwrap_or_default();
+    match interpreter.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.') {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => "bash",
+        "ruby" => "ruby",
+        "python" => "python",
+        "node" => "javascript",
+        "lua" => "lua",
+        "php" => "php",
+        "groovy" => "groovy",
+        "kotlin" => "kotlin",
+        "swift" => "swift",
+        _ => language,
+    }
+}
+
 /// Very rough binary sniff: NUL byte in the first 8 KiB.
 pub fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
@@ -222,4 +258,66 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// File names sampled from the DMote repo (iOS + Android + fastlane).
+    #[test]
+    fn dmote_files_map_to_highlighted_languages() {
+        let cases = [
+            ("DMote/App/DMoteApp.swift", "swift"),
+            ("DMoteCoreIOS/Package.swift", "swift"),
+            ("app/src/main/java/com/dlabs/dmoteapp/MainActivity.kt", "kotlin"),
+            ("app/build.gradle.kts", "kotlin"),
+            ("settings.gradle", "groovy"),
+            ("app/src/main/AndroidManifest.xml", "xml"),
+            ("app/src/main/res/values/strings.xml", "xml"),
+            ("DMote/Info.plist", "xml"),
+            ("DMote/DMote.entitlements", "xml"),
+            ("DMote/PrivacyInfo.xcprivacy", "xml"),
+            ("DMote.xcodeproj/xcshareddata/xcschemes/DMote.xcscheme", "xml"),
+            ("DMote.xcodeproj/project.xcworkspace/contents.xcworkspacedata", "xml"),
+            ("Breakpoints_v2.xcbkptlist", "xml"),
+            (".idea/DMote_Android.iml", "xml"),
+            ("en.lproj/Localizable.stringsdict", "xml"),
+            ("DMote.xcodeproj/project.pbxproj", "openstep_plist"),
+            ("en.lproj/Localizable.strings", "openstep_plist"),
+            ("DMote/Config/Keys.xcconfig", "xcconfig"),
+            ("Localization/Localizable.xcstrings", "json"),
+            ("Package.resolved", "json"),
+            ("Assets.xcassets/AppIcon.appiconset/Contents.json", "json"),
+            ("gradle.properties", "properties"),
+            ("app/proguard-rules.pro", "proguard"),
+            ("dmotecore/consumer-rules.pro", "proguard"),
+            ("gradle/libs.versions.toml", "toml"),
+            (".github/workflows/ci.yml", "yaml"),
+            ("fastlane/Fastfile", "ruby"),
+            ("fastlane/Appfile", "ruby"),
+            ("Gemfile", "ruby"),
+            ("scripts/screens.sh", "bash"),
+            ("gradlew", "bash"),
+            ("gradlew.bat", "batch"),
+            ("Makefile", "make"),
+            ("README.md", "markdown"),
+            (".gitignore", "gitignore"),
+            ("scripts/resize.py", "python"),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(language_for(Path::new(name)), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn extensionless_scripts_use_the_shebang() {
+        let run = Path::new("fastlane/run");
+        assert_eq!(detect_language(run, "#!/bin/bash\nset -e\n"), "bash");
+        assert_eq!(detect_language(run, "#!/usr/bin/env -S ruby -w\n"), "ruby");
+        assert_eq!(detect_language(run, "#!/usr/bin/env python3\n"), "python");
+        assert_eq!(detect_language(run, "plain notes\n"), "text");
+        // An extension wins over the shebang.
+        assert_eq!(detect_language(Path::new("x.swift"), "#!/usr/bin/env bash\n"), "swift");
+    }
 }
