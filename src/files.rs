@@ -1,5 +1,3 @@
-//! Lazily loaded project file tree, flattened into rows for a virtual list.
-
 use std::path::{Path, PathBuf};
 
 const IGNORED: &[&str] = &[".git", ".DS_Store", "node_modules", "target", ".build", ".gradle", ".idea"];
@@ -58,7 +56,6 @@ impl Node {
         self.children = Some(children);
     }
 
-    /// Re-reads every loaded directory, keeping expansion state.
     pub fn refresh(&mut self) {
         if !self.is_dir || self.children.is_none() {
             return;
@@ -91,7 +88,6 @@ impl Node {
         false
     }
 
-    /// Expands every ancestor of `path` so it becomes visible.
     pub fn reveal(&mut self, path: &Path) {
         let Ok(relative) = path.strip_prefix(&self.path) else { return };
         let mut current = self.path.clone();
@@ -145,7 +141,6 @@ impl Node {
     }
 }
 
-/// Language id for the editor's highlighter, derived from the file name.
 pub fn language_for(path: &Path) -> &'static str {
     let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     match name.as_str() {
@@ -212,8 +207,6 @@ pub fn language_for(path: &Path) -> &'static str {
     }
 }
 
-/// `language_for`, falling back to the `#!` line for extensionless scripts
-/// (fastlane's `run`, `gradlew`-style wrappers).
 pub fn detect_language(path: &Path, text: &str) -> &'static str {
     let language = language_for(path);
     if language != "text" {
@@ -221,7 +214,6 @@ pub fn detect_language(path: &Path, text: &str) -> &'static str {
     }
     let first = text.lines().next().unwrap_or_default();
     let Some(shebang) = first.strip_prefix("#!") else { return language };
-    // `#!/usr/bin/env ruby` names the interpreter last; `#!/bin/bash -e` first.
     let mut words = shebang.split_whitespace();
     let program = words.next().unwrap_or_default();
     let program = if program.ends_with("/env") { words.find(|w| !w.starts_with('-')).unwrap_or_default() } else { program };
@@ -240,14 +232,11 @@ pub fn detect_language(path: &Path, text: &str) -> &'static str {
     }
 }
 
-/// Very rough binary sniff: NUL byte in the first 8 KiB.
 pub fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }
 
-/// Write via a temp file + rename so a crash never leaves a half-written file.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    // Follow symlinks so the link itself survives the rename.
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let path = resolved.as_path();
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -264,14 +253,11 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     result
 }
 
-/// Writes `tmp` with the permissions of `original` and flushes it to disk, so
-/// the rename never publishes a file whose data is still only in the cache.
 fn write_synced(tmp: &Path, original: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut file = std::fs::File::create(tmp)?;
     file.write_all(contents)?;
     if let Ok(meta) = std::fs::metadata(original) {
-        // Losing the executable bit of a script would be a silent change.
         file.set_permissions(meta.permissions())?;
     }
     file.sync_all()
@@ -293,12 +279,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
         assert!(!dir.join(".run.sh.forge-tmp").exists());
-        // A failed write leaves no temp file behind.
         assert!(write_atomic(&dir.join("missing/x.txt"), b"x").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// File names sampled from the DMote repo (iOS + Android + fastlane).
     #[test]
     fn dmote_files_map_to_highlighted_languages() {
         let cases = [
@@ -351,7 +335,6 @@ mod tests {
         assert_eq!(detect_language(run, "#!/usr/bin/env -S ruby -w\n"), "ruby");
         assert_eq!(detect_language(run, "#!/usr/bin/env python3\n"), "python");
         assert_eq!(detect_language(run, "plain notes\n"), "text");
-        // An extension wins over the shebang.
         assert_eq!(detect_language(Path::new("x.swift"), "#!/usr/bin/env bash\n"), "swift");
     }
 }

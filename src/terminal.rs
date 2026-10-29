@@ -1,6 +1,3 @@
-//! Embedded terminal: a login shell on a PTY, parsed by `vt100`, painted as
-//! one styled text run per row.
-
 use std::io::{Read as _, Write};
 use std::num::NonZeroU16;
 use std::ops::Range;
@@ -17,10 +14,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use crate::theme::{MONO_FONT, Palette, c};
 
-/// Row height relative to the font size (12.5 pt → 17 px, as before).
 const LINE_HEIGHT_RATIO: f32 = 1.36;
-/// Scrollback rows kept per terminal. Each row costs 32 bytes per column, so
-/// a full 160-column scrollback is ~10 MB at 2,000 rows (was ~26 MB at 5,000).
 const SCROLLBACK: usize = 2_000;
 const PADDING: f32 = 8.;
 
@@ -36,7 +30,6 @@ pub struct Terminal {
     focus: FocusHandle,
     size: (u16, u16),
     cell_width: Option<Pixels>,
-    /// Font size the cached cell width and row height belong to.
     font_size: f32,
     scroll_remainder: f32,
     exited: bool,
@@ -97,7 +90,6 @@ impl Terminal {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         parser.lock().unwrap().process(&buf[..n]);
-                        // Coalesce redraws: one pending notification is enough.
                         let _ = tx.try_send(());
                     }
                 }
@@ -201,7 +193,6 @@ impl Terminal {
                     self.write(b"\x0c");
                     cx.stop_propagation();
                 }
-                // Leave every other ⌘ shortcut to the app.
                 _ => {}
             }
             return;
@@ -242,7 +233,6 @@ impl Terminal {
         let mut parser = self.parser.lock().unwrap();
         if parser.screen().alternate_screen() {
             drop(parser);
-            // Full-screen apps (less, vim) get arrow keys instead.
             let key: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
             for _ in 0..lines.unsigned_abs().min(10) {
                 self.write(key);
@@ -257,7 +247,6 @@ impl Terminal {
     fn cell_width(&mut self, window: &mut Window, cx: &App) -> Pixels {
         let font_size = crate::settings::Settings::get(cx).terminal_font_size;
         if font_size != self.font_size {
-            // Font changed in Settings: re-measure and re-fit rows/cols.
             self.font_size = font_size;
             self.cell_width = None;
             self.size = (0, 0);
@@ -375,9 +364,6 @@ impl Render for Terminal {
     }
 }
 
-/// Normalises newlines and, for bracketed paste, strips the end marker so a
-/// pasted `ESC[201~` cannot end the paste early and run the rest as typed
-/// commands (xterm does the same).
 fn paste_text(text: &str, bracketed: bool) -> String {
     let text = text.replace("\r\n", "\r").replace('\n', "\r");
     if bracketed { text.replace("\x1b[201~", "").replace("\x1b[200~", "") } else { text }

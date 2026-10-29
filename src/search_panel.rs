@@ -1,6 +1,3 @@
-//! Find-in-project panel (⇧⌘F). Results stream in while the search runs and
-//! render through a virtual list, so huge result sets stay cheap.
-
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -139,7 +136,6 @@ impl SearchPanel {
                 self.running = true;
                 self.task = Some(cx.spawn(async move |this, cx| {
                     while let Ok(batch) = rx.recv_async().await {
-                        // Drain whatever else is queued so one frame takes many batches.
                         let mut batch = batch;
                         batch.extend(rx.drain().flatten());
                         if this.update(cx, |this, cx| this.append(batch, cx)).is_err() {

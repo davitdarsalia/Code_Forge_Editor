@@ -1,7 +1,3 @@
-//! ⌘P: multi-mode search overlay. The query prefix picks the mode:
-//! none = files (fuzzy, over the project index), `#` = full-text search,
-//! `:` = go to line, `>` = app commands, `@` = symbols in the active file.
-
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +21,6 @@ use crate::symbols::{self, Symbol};
 use crate::theme::{Palette, ca};
 
 const MAX_RESULTS: usize = 60;
-/// Text matches shown; the search is cancelled once this many arrived.
 const MAX_TEXT_RESULTS: usize = 200;
 const TEXT_DEBOUNCE: Duration = Duration::from_millis(80);
 
@@ -77,7 +72,6 @@ impl Mode {
     }
 }
 
-/// Splits the raw input into its mode and the query after the prefix.
 pub fn parse_query(raw: &str) -> (Mode, &str) {
     for mode in Mode::ALL {
         if !mode.prefix().is_empty() {
@@ -89,7 +83,6 @@ pub fn parse_query(raw: &str) -> (Mode, &str) {
     (Mode::Files, raw)
 }
 
-/// `120` or `120:5` (1-based) -> 0-based (line, column).
 pub fn parse_line(query: &str) -> Option<(u32, u32)> {
     let query = query.trim();
     let (line, column) = match query.split_once([':', ',']) {
@@ -106,7 +99,6 @@ pub fn parse_line(query: &str) -> Option<(u32, u32)> {
 
 pub enum QuickOpenEvent {
     Open(PathBuf),
-    /// 0-based line and char column.
     OpenAt { path: PathBuf, line: u32, column: u32 },
     Run(Box<dyn Action>),
     Dismiss,
@@ -127,7 +119,6 @@ pub struct QuickOpen {
     mode: Mode,
     index: Option<Arc<FileIndex>>,
     active: Option<ActiveFile>,
-    /// Fuzzy hits for files, commands or symbols (whichever mode is on).
     hits: Vec<FuzzyHit>,
     text_hits: Vec<TextHit>,
     text_running: bool,
@@ -187,7 +178,6 @@ impl QuickOpen {
     ) {
         self.index = index;
         self.active = active.map(|(path, editor)| ActiveFile { path, editor });
-        // The file may have changed since the last scan.
         self.symbols = None;
         self.symbols_task = None;
         self.cancel_search();
@@ -230,8 +220,6 @@ impl QuickOpen {
         cx.notify();
     }
 
-    // ---- Text mode -------------------------------------------------------
-
     fn cancel_search(&mut self) {
         if let Some(handle) = self.search.take() {
             handle.cancel();
@@ -247,7 +235,6 @@ impl QuickOpen {
             self.text_hits.clear();
             return;
         }
-        // Replacing the task drops the pending timer: a debounce.
         self.search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(TEXT_DEBOUNCE).await;
             let _ = this.update(cx, |this, cx| this.run_search(&query, cx));
@@ -268,7 +255,6 @@ impl QuickOpen {
                 self.search_task = Some(cx.spawn(async move |this, cx| {
                     while let Ok(batch) = rx.recv_async().await {
                         let mut batch = batch;
-                        // Drain whatever else is queued so one frame takes many batches.
                         batch.extend(rx.drain().flatten());
                         let full = this
                             .update(cx, |this, cx| {
@@ -301,8 +287,6 @@ impl QuickOpen {
         cx.notify();
     }
 
-    // ---- Symbols mode ----------------------------------------------------
-
     fn scan_symbols(&mut self, cx: &mut Context<Self>) {
         if self.symbols_task.is_some() {
             return;
@@ -323,8 +307,6 @@ impl QuickOpen {
             });
         }));
     }
-
-    // ---- Selection -------------------------------------------------------
 
     fn row_count(&self) -> usize {
         match self.mode {
@@ -380,7 +362,6 @@ impl QuickOpen {
         cx.notify();
     }
 
-    /// Rewrites the prefix so the query text survives a mode switch.
     fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.input.read(cx).value();
         let (_, query) = parse_query(&raw);
@@ -389,7 +370,6 @@ impl QuickOpen {
             input.set_value(value, window, cx);
             input.focus(window, cx);
         });
-        // `set_value` does not emit Change.
         self.update_hits(cx);
         self.sync_placeholder(window, cx);
     }
@@ -729,7 +709,6 @@ fn faint_ellipsis(text: String) -> impl IntoElement {
         .child(text)
 }
 
-/// Bold accent highlight for the matched characters of `text`.
 fn char_highlights(text: &str, chars: impl Iterator<Item = u32>) -> Vec<(Range<usize>, HighlightStyle)> {
     let offsets: Vec<(usize, usize)> = text.char_indices().map(|(i, c)| (i, i + c.len_utf8())).collect();
     let style = HighlightStyle {
@@ -753,7 +732,6 @@ mod tests {
         assert_eq!(parse_query(":12"), (Mode::Line, "12"));
         assert_eq!(parse_query(">toggle"), (Mode::Commands, "toggle"));
         assert_eq!(parse_query("@render"), (Mode::Symbols, "render"));
-        // Only the first character is a prefix.
         assert_eq!(parse_query("a#b"), (Mode::Files, "a#b"));
     }
 

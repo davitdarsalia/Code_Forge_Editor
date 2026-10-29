@@ -1,12 +1,3 @@
-//! Disk cache for `xcodebuild -list`.
-//!
-//! Listing schemes resolves Swift packages and is expensive: on DMote one call
-//! takes ~10 s wall, ~21 s CPU and ~200 MB, and it ran for every Xcode
-//! container on every project open. A scheme list only changes when the
-//! project file, a scheme file or the package manifest changes, so the cache
-//! keys each container by a fingerprint of those files' mtimes and re-runs
-//! `xcodebuild` only when the fingerprint moves.
-
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -32,7 +23,6 @@ fn store_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|dir| dir.join("Forge").join("schemes.json"))
 }
 
-/// Cached `build::list_schemes`. Background only (stat calls, maybe a process).
 pub fn list_schemes(dir: &Path, container: &XcodeContainer) -> anyhow::Result<Vec<String>> {
     let key = container_path(container).to_path_buf();
     let fingerprint = fingerprint(container);
@@ -43,12 +33,9 @@ pub fn list_schemes(dir: &Path, container: &XcodeContainer) -> anyhow::Result<Ve
     }
     let schemes = build::list_schemes(dir, container)?;
     if let Some(path) = path {
-        // Containers are listed in parallel: re-read under a lock so one
-        // listing's write does not drop another's.
         static WRITE: Mutex<()> = Mutex::new(());
         let _guard = WRITE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut store = load(&path);
-        // Drop entries whose container is gone so the file stays small.
         store.entries.retain(|p, _| p.exists());
         store.entries.insert(key, Entry { fingerprint, schemes: schemes.clone() });
         save(&path, &store);
@@ -91,8 +78,6 @@ fn container_path(container: &XcodeContainer) -> &Path {
     }
 }
 
-/// Hash of (path, mtime) for every file whose change can change the scheme
-/// list. Directory mtimes catch scheme files being added, removed or renamed.
 pub fn fingerprint(container: &XcodeContainer) -> u64 {
     let mut inputs = Vec::new();
     match container {
@@ -100,8 +85,6 @@ pub fn fingerprint(container: &XcodeContainer) -> u64 {
         XcodeContainer::Workspace(workspace) => {
             inputs.push(workspace.join("contents.xcworkspacedata"));
             scheme_dirs(workspace, &mut inputs);
-            // Workspaces list the schemes of the projects they wrap, which
-            // in practice sit next to them.
             if let Some(parent) = workspace.parent() {
                 inputs.push(parent.to_path_buf());
                 for project in children(parent).filter(|p| p.extension().is_some_and(|e| e == "xcodeproj")) {
@@ -128,7 +111,6 @@ fn project_inputs(project: &Path, inputs: &mut Vec<PathBuf>) {
     scheme_dirs(project, inputs);
 }
 
-/// Shared and per-user scheme folders of an .xcodeproj / .xcworkspace.
 fn scheme_dirs(container: &Path, inputs: &mut Vec<PathBuf>) {
     inputs.push(container.join("xcshareddata/xcschemes"));
     let user_data = container.join("xcuserdata");
@@ -142,7 +124,6 @@ fn children(dir: &Path) -> impl Iterator<Item = PathBuf> {
     std::fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path())
 }
 
-/// `None` for a missing file, so creating one changes the fingerprint too.
 fn mtime_nanos(path: &Path) -> Option<u128> {
     let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
     Some(modified.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0))

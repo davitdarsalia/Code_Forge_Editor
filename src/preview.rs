@@ -1,10 +1,3 @@
-//! Live canvas for a single JSX/TSX file, in the spirit of Xcode previews.
-//!
-//! A native WKWebView (via wry) floats over the GPUI window, kept inside the
-//! bounds of a placeholder element. The page compiles the source with Babel and
-//! renders it with React; imports other than react/react-dom become labeled
-//! stubs until real module resolution exists.
-
 use std::cell::Cell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
@@ -15,7 +8,6 @@ use gpui_kit::{App, Bounds, Pixels, Window};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{Rect, WebView, WebViewBuilder};
 
-/// How long after the last keystroke the canvas re-renders.
 pub const UPDATE_DELAY: Duration = Duration::from_millis(150);
 
 const PAGE: &str = include_str!("../assets/preview/index.html");
@@ -36,7 +28,6 @@ impl Preview {
         Preview { webview: None, visible: Rc::new(Cell::new(false)), sent: None }
     }
 
-    /// Renders `source` in the canvas, creating the web view on first use.
     pub fn update(&mut self, path: &Path, source: &str, window: &Window) {
         let mut hasher = DefaultHasher::new();
         (path, source).hash(&mut hasher);
@@ -81,8 +72,6 @@ impl Preview {
         }
     }
 
-    /// Prepaint callback for the placeholder element: moves the native view
-    /// onto the element's bounds and shows it.
     pub fn place(&self) -> impl FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static {
         let webview = self.webview.clone();
         let visible = self.visible.clone();
@@ -114,7 +103,6 @@ fn set_visible(webview: &WebView, visible: &Cell<bool>, value: bool) {
     }
 }
 
-/// JSON string literal that is also safe inside an inline `<script>`.
 fn js_string(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into()).replace("</", "<\\/")
 }

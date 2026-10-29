@@ -1,28 +1,16 @@
-//! Cheap, language-agnostic symbol list for the ⌘P `@` mode: a line scanner
-//! that recognises declaration keywords (fn, func, class, struct, …) after
-//! stripping common modifiers. No parsing, so it is fast on any file size and
-//! wrong only in harmless ways (a missed or extra entry).
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Symbol {
     pub name: String,
-    /// The declaring keyword as written (`fn`, `class`, …).
     pub kind: &'static str,
-    /// 0-based line.
     pub line: u32,
-    /// 0-based char column of the name.
     pub column: u32,
 }
 
-/// Keywords that declare callables or types; recognised at any indent so
-/// methods inside classes/impls are listed too.
 const DECL_KEYWORDS: &[&str] = &[
     "fn", "func", "function", "def", "fun", "class", "struct", "enum", "trait", "interface",
     "protocol", "extension", "impl", "mod", "module", "object", "union", "namespace",
 ];
 
-/// Keywords that declare values; only top-level (unindented) lines count, or
-/// every local variable would show up.
 const VALUE_KEYWORDS: &[&str] = &["val", "let", "var", "const", "static", "type", "typealias"];
 
 const MODIFIERS: &[&str] = &[
@@ -47,7 +35,6 @@ fn parse_line(line: &str, line_no: u32) -> Option<Symbol> {
     let mut stripped_static = false;
     loop {
         rest = rest.trim_start();
-        // Annotations / attributes: `@objc`, `@MainActor`.
         if let Some(after) = rest.strip_prefix('@') {
             rest = skip_word(after);
             continue;
@@ -57,7 +44,6 @@ fn parse_line(line: &str, line_no: u32) -> Option<Symbol> {
             return None;
         }
         let after = &rest[word.len()..];
-        // `pub(crate)`, `extern "C"`.
         if word == "pub" && after.starts_with('(') {
             rest = &after[after.find(')')? + 1..];
             continue;
@@ -71,8 +57,6 @@ fn parse_line(line: &str, line_no: u32) -> Option<Symbol> {
             let next = leading_word(after.trim_start());
             DECL_KEYWORDS.contains(&next) || VALUE_KEYWORDS.contains(&next) || MODIFIERS.contains(&next)
         };
-        // `enum class` (Kotlin), `class func` (Swift), `static fn`: a keyword
-        // followed by another keyword is acting as a modifier.
         if (MODIFIERS.contains(&word) && next_is_keyword())
             || (matches!(word, "class" | "static" | "const") && next_is_keyword())
         {
@@ -91,7 +75,6 @@ fn parse_line(line: &str, line_no: u32) -> Option<Symbol> {
             (None, Some(k)) if indent == 0 && !stripped_static => k,
             _ => return None,
         };
-        // `impl<T>`, `function* gen` are the only non-space separators.
         let separator_ok = after.starts_with(char::is_whitespace)
             || (kind == "impl" && after.starts_with('<'))
             || (kind == "function" && after.starts_with('*'));
@@ -103,12 +86,10 @@ fn parse_line(line: &str, line_no: u32) -> Option<Symbol> {
     }
 }
 
-/// Reads the declared name starting at byte `from` in `line`.
 fn name_after(line: &str, from: usize, kind: &'static str, line_no: u32) -> Option<Symbol> {
     let mut pos = from + (line[from..].len() - line[from..].trim_start().len());
     let rest = &line[pos..];
     if kind == "impl" {
-        // `impl<T> Display for Foo<T> {` reads best as the whole header.
         let header = rest.split(['{', ';']).next()?.split(" where ").next()?.trim();
         let header = strip_generics_prefix(header);
         if header.is_empty() {
@@ -116,13 +97,11 @@ fn name_after(line: &str, from: usize, kind: &'static str, line_no: u32) -> Opti
         }
         return Some(Symbol { name: format!("impl {header}"), kind, line: line_no, column: char_col(line, pos) });
     }
-    // Go receivers: `func (s *Server) Name(`.
     if kind == "func" && rest.starts_with('(') {
         let close = rest.find(')')?;
         let after = &rest[close + 1..];
         pos += close + 1 + (after.len() - after.trim_start().len());
     }
-    // JS generators: `function* gen`.
     let rest = &line[pos..];
     if let Some(after) = rest.strip_prefix('*') {
         pos += 1 + (after.len() - after.trim_start().len());
@@ -138,7 +117,6 @@ fn name_after(line: &str, from: usize, kind: &'static str, line_no: u32) -> Opti
     Some(Symbol { name: name.to_string(), kind, line: line_no, column: char_col(line, pos) })
 }
 
-/// `<T: Clone> Foo<T>` -> `Foo<T>` (the generics right after `impl`).
 fn strip_generics_prefix(s: &str) -> &str {
     if !s.starts_with('<') {
         return s;
@@ -166,7 +144,6 @@ fn leading_word(s: &str) -> &str {
 fn skip_word(s: &str) -> &str {
     let word = s.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')).unwrap_or(s.len());
     let mut rest = &s[word..];
-    // `@available(iOS 15, *)`
     if rest.starts_with('(') {
         rest = rest.find(')').map_or("", |i| &rest[i + 1..]);
     }

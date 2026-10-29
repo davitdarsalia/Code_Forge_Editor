@@ -1,8 +1,3 @@
-//! Project build integration, no UI: detects Xcode and Gradle projects under
-//! the open folder, turns a target + action into a command line, runs it
-//! (cancellable, output streamed line by line) and parses compiler
-//! diagnostics out of the output.
-
 use std::collections::HashSet;
 use std::io::{BufRead as _, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -10,9 +5,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// How deep below the project root detection looks for build files.
 pub const DETECT_DEPTH: usize = 4;
-/// Directories never worth descending into (outputs, caches, vendored code).
 const SKIP_DIRS: &[&str] = &[
     "build", "Build", "DerivedData", "node_modules", "Pods", "Carthage", "target", "vendor",
     "fastlane", "out", "dist",
@@ -23,7 +16,6 @@ pub const GENERIC_SIMULATOR: &str = "generic/platform=iOS Simulator";
 pub enum XcodeContainer {
     Workspace(PathBuf),
     Project(PathBuf),
-    /// A directory holding `Package.swift`.
     Package(PathBuf),
 }
 
@@ -36,7 +28,6 @@ pub enum ModuleKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GradleModule {
-    /// Gradle path without the leading colon, e.g. `app` or `core:domain`.
     pub path: String,
     pub kind: ModuleKind,
 }
@@ -50,7 +41,6 @@ pub enum ProjectKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuildProject {
     pub name: String,
-    /// Directory the build command runs in.
     pub dir: PathBuf,
     pub kind: ProjectKind,
 }
@@ -60,7 +50,6 @@ impl BuildProject {
         matches!(self.kind, ProjectKind::Xcode { .. })
     }
 
-    /// Picker label for the project itself, e.g. "DMote (iOS)".
     pub fn label(&self) -> String {
         match &self.kind {
             ProjectKind::Xcode { container: XcodeContainer::Package(_), .. } => format!("{} (SwiftPM)", self.name),
@@ -69,8 +58,6 @@ impl BuildProject {
         }
     }
 
-    /// Selectable units: schemes for Xcode, modules for Gradle. `None` means
-    /// "the whole project" (no schemes listed yet, or a single-root build).
     pub fn units(&self) -> Vec<Option<String>> {
         let names: Vec<String> = match &self.kind {
             ProjectKind::Xcode { schemes, .. } => schemes.clone(),
@@ -83,7 +70,6 @@ impl BuildProject {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Destination {
     pub label: String,
-    /// Value for `xcodebuild -destination`.
     pub spec: String,
 }
 
@@ -101,7 +87,6 @@ impl Destination {
 pub enum BuildAction {
     Build,
     Clean,
-    /// Gradle `installDebug` (no Xcode equivalent yet).
     Install,
 }
 
@@ -123,11 +108,6 @@ impl BuildAction {
     }
 }
 
-// ---- Detection --------------------------------------------------------------
-
-/// Finds build roots below `root` (depth-limited, build outputs ignored).
-/// Fast: only reads directory listings and small settings files. Scheme
-/// lists are filled in later by [`list_schemes`].
 pub fn detect(root: &Path) -> Vec<BuildProject> {
     let mut found = Vec::new();
     walk(root, 0, &mut found);
@@ -167,7 +147,6 @@ fn walk(dir: &Path, depth: usize, found: &mut Vec<BuildProject>) {
 
     let stem = |p: &Path| p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let dir_name = dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    // A workspace wraps its projects, so it wins; otherwise one entry per project.
     if let Some(ws) = workspaces.first() {
         found.push(xcode(stem(ws), dir, XcodeContainer::Workspace(ws.clone())));
     } else if !projects.is_empty() {
@@ -201,7 +180,6 @@ fn xcode(name: String, dir: &Path, container: XcodeContainer) -> BuildProject {
     BuildProject { name, dir: dir.to_path_buf(), kind: ProjectKind::Xcode { container, schemes: Vec::new() } }
 }
 
-/// `rootProject.name = "X"` from a settings script.
 pub fn gradle_root_name(settings: &str) -> Option<String> {
     settings.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("rootProject.name")?.trim_start().strip_prefix('=')?;
@@ -209,7 +187,6 @@ pub fn gradle_root_name(settings: &str) -> Option<String> {
     })
 }
 
-/// Module paths from `include(":a", ":b")` / `include ':a'` lines.
 pub fn gradle_includes(settings: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in settings.lines() {
@@ -228,7 +205,6 @@ pub fn gradle_includes(settings: &str) -> Vec<String> {
     out
 }
 
-/// Every single- or double-quoted string literal on a line.
 fn quoted(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -260,7 +236,6 @@ pub fn classify_module(script: &str) -> ModuleKind {
     }
 }
 
-/// Runs `xcodebuild -list -json` for a container. Slow (seconds): background only.
 pub fn list_schemes(dir: &Path, container: &XcodeContainer) -> anyhow::Result<Vec<String>> {
     let mut command = Command::new("xcodebuild");
     command.current_dir(dir).arg("-list").arg("-json");
@@ -286,7 +261,6 @@ pub fn parse_scheme_list(json: &str) -> anyhow::Result<Vec<String>> {
     Ok(schemes)
 }
 
-/// Booted simulators (`xcrun simctl list devices booted -j`). Background only.
 pub fn booted_simulators() -> Vec<Destination> {
     let output = Command::new("xcrun")
         .args(["simctl", "list", "devices", "booted", "-j"])
@@ -324,8 +298,6 @@ pub fn parse_simulators(json: &str) -> Vec<Destination> {
     out
 }
 
-// ---- Commands ---------------------------------------------------------------
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommandLine {
     pub program: String,
@@ -341,8 +313,6 @@ impl CommandLine {
     }
 }
 
-/// Command for `action` on one unit (scheme/module) of a project.
-/// `None` when the action does not apply (Install on Xcode, on a library).
 pub fn command_for(
     project: &BuildProject,
     unit: Option<&str>,
@@ -390,8 +360,6 @@ pub fn command_for(
     }
 }
 
-// ---- Diagnostics ------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Severity {
     Error,
@@ -402,13 +370,11 @@ pub enum Severity {
 pub struct Issue {
     pub severity: Severity,
     pub path: Option<PathBuf>,
-    /// 1-based, as printed by the compiler (0 when unknown).
     pub line: u32,
     pub column: u32,
     pub message: String,
 }
 
-/// Drops ANSI escape sequences (Gradle and some tools colour their output).
 pub fn strip_ansi(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -429,9 +395,6 @@ pub fn strip_ansi(line: &str) -> String {
     out
 }
 
-/// Recognises clang/swiftc/javac (`/p:12:5: error: m`), kotlinc
-/// (`e: file:///p:12:5 m`, old `e: /p: (12, 5): m`) and location-less
-/// `error: m` lines.
 pub fn parse_issue(line: &str) -> Option<Issue> {
     let line = line.trim_end();
     parse_kotlin(line).or_else(|| parse_clang(line)).or_else(|| parse_bare(line))
@@ -449,7 +412,6 @@ fn parse_kotlin(line: &str) -> Option<Issue> {
     if !path_part.starts_with('/') {
         return Some(Issue { severity, path: None, line: 0, column: 0, message: rest.to_string() });
     }
-    // Old format: `/p/A.kt: (12, 5): message`.
     if let Some(ix) = path_part.find(": (") {
         let after = &path_part[ix + 3..];
         if let Some(close) = after.find("): ") {
@@ -465,13 +427,11 @@ fn parse_kotlin(line: &str) -> Option<Issue> {
             }
         }
     }
-    // New format: `/p/A.kt:12:5 message`.
     let (location, message) = path_part.split_once(' ')?;
     let (path, line_no, column) = split_location(location)?;
     Some(Issue { severity, path: Some(path), line: line_no, column, message: message.to_string() })
 }
 
-/// `path:line[:col]` → parts. Splits from the right so paths keep colons.
 fn split_location(location: &str) -> Option<(PathBuf, u32, u32)> {
     let (head, last) = location.rsplit_once(':')?;
     let last = last.parse::<u32>().ok()?;
@@ -512,7 +472,6 @@ fn parse_bare(line: &str) -> Option<Issue> {
     Some(Issue { severity: Severity::Error, path: None, line: 0, column: 0, message: message.to_string() })
 }
 
-/// Keeps first occurrences only: xcodebuild repeats diagnostics per arch.
 #[derive(Default)]
 pub struct IssueSet {
     seen: HashSet<Issue>,
@@ -524,27 +483,20 @@ impl IssueSet {
     }
 }
 
-// ---- Running ----------------------------------------------------------------
-
 pub enum RunEvent {
     Line(String, Option<Issue>),
-    /// Exit code; `None` when killed by a signal.
     Exited(Option<i32>),
     Failed(String),
 }
 
-/// How long a stopped build gets to exit before its group is SIGKILLed.
 const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// A running build. Dropping it does not stop the process; call [`stop`](Self::stop).
 pub struct RunHandle {
     pid: i32,
     exited: Arc<AtomicBool>,
 }
 
 impl RunHandle {
-    /// SIGTERMs the whole process group (xcodebuild/Gradle spawn helpers),
-    /// escalating to SIGKILL if it is still alive after a grace period.
     pub fn stop(&self) {
         signal_group(self.pid, libc::SIGTERM);
         let (pid, exited) = (self.pid, self.exited.clone());
@@ -561,7 +513,6 @@ impl RunHandle {
 }
 
 fn signal_group(pid: i32, signal: libc::c_int) {
-    // SAFETY: plain syscall; a negative pid targets the process group we created.
     if unsafe { libc::kill(-pid, signal) } != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::ESRCH) {
@@ -570,9 +521,6 @@ fn signal_group(pid: i32, signal: libc::c_int) {
     }
 }
 
-/// Spawns `command` through the user's login shell (so PATH, JAVA_HOME and
-/// friends match the terminal) in its own process group. Output lines and
-/// the exit arrive on `tx` from reader threads; nothing polls.
 pub fn spawn(command: &CommandLine, tx: flume::Sender<RunEvent>) -> anyhow::Result<RunHandle> {
     use std::os::unix::process::CommandExt as _;
     let shell = login_shell(std::env::var("SHELL").ok().as_deref());
@@ -589,7 +537,6 @@ pub fn spawn(command: &CommandLine, tx: flume::Sender<RunEvent>) -> anyhow::Resu
         .stderr(Stdio::piped())
         .process_group(0);
     if std::env::var_os("JAVA_HOME").is_none() {
-        // Android Studio's bundled JDK, the usual one on a Mac without a system JDK.
         let jbr = Path::new("/Applications/Android Studio.app/Contents/jbr/Contents/Home");
         if jbr.is_dir() {
             child.env("JAVA_HOME", jbr);
@@ -623,8 +570,6 @@ pub fn spawn(command: &CommandLine, tx: flume::Sender<RunEvent>) -> anyhow::Resu
     Ok(RunHandle { pid, exited })
 }
 
-/// The user's shell when it is POSIX-like; `exec "$0" "$@"` (which keeps the
-/// arguments out of shell parsing) means nothing to fish, csh or nushell.
 fn login_shell(shell: Option<&str>) -> String {
     const POSIX: &[&str] = &["sh", "bash", "zsh", "ksh", "dash"];
     shell
@@ -669,7 +614,6 @@ mod tests {
         assert_eq!(login_shell(None), "/bin/zsh");
     }
 
-    /// Scheme names and paths reach the program as argv, never as shell text.
     #[test]
     fn spawn_passes_hostile_arguments_verbatim() {
         let dir = temp_dir("argv");
@@ -708,12 +652,9 @@ mod tests {
     #[test]
     fn detects_monorepo_layout() {
         let root = temp_dir("mono");
-        // iOS app: project with an embedded workspace that must not count,
-        // plus a local Swift package.
         std::fs::create_dir_all(root.join("DmoteIOS/DMote.xcodeproj/project.xcworkspace")).unwrap();
         touch(&root.join("DmoteIOS/DMoteCoreIOS/Package.swift"), "// swift-tools-version:5.9");
         touch(&root.join("DmoteIOS/.build/checkouts/Dep/Package.swift"), "");
-        // Android app with two modules and a nested standalone Gradle build.
         touch(&root.join("DMoteAndroid/gradlew"), "#!/bin/sh");
         touch(
             &root.join("DMoteAndroid/settings.gradle.kts"),

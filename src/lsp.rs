@@ -1,15 +1,3 @@
-//! Go to Definition through language servers: sourcekit-lsp for Swift,
-//! rust-analyzer for Rust.
-//!
-//! A server starts the first time a definition is asked for in its language
-//! and root (⌘-hover, ⌘-click, ⌃⌘J), never at launch, and is shut down after
-//! `IDLE_SHUTDOWN` without use, so startup time and idle RAM stay as they were.
-//! Buffers sync lazily: an edit only marks the document stale, and the full
-//! text goes to the server right before its next request.
-//!
-//! The protocol runs on two threads per server (stdin writer, stdout reader);
-//! the UI thread only enqueues messages and awaits replies on channels.
-
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -28,13 +16,9 @@ use serde_json::{Value, json};
 
 use crate::format;
 
-/// A server unused for this long is shut down; the next request restarts it.
 const IDLE_SHUTDOWN: Duration = Duration::from_secs(10 * 60);
-/// How long the writer waits for the `initialize` reply before giving up.
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// Lines of server stderr kept to explain a crash.
 const STDERR_TAIL: usize = 4;
-/// JSON-RPC `ContentModified`: rust-analyzer answers it while still loading.
 const CONTENT_MODIFIED: i64 = -32801;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -44,7 +28,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// The server for a language name from `files::detect_language`.
     pub fn for_language(language: &str) -> Option<Kind> {
         match language {
             "swift" => Some(Kind::Swift),
@@ -74,8 +57,6 @@ impl Kind {
         }
     }
 
-    /// Nested packages are separate SwiftPM roots, so Swift takes the nearest
-    /// manifest; a Cargo workspace is one root, so Rust takes the topmost.
     fn prefers_topmost(self) -> bool {
         self == Kind::Rust
     }
@@ -94,15 +75,11 @@ impl Kind {
     fn initialization_options(self) -> Value {
         match self {
             Kind::Swift => Value::Null,
-            // No `cargo check` on save (Forge has its own build), and build
-            // scripts compile into target/rust-analyzer so they never hold
-            // the lock a ⇧⌘B build needs.
             Kind::Rust => json!({ "checkOnSave": false, "cargo": { "targetDir": true } }),
         }
     }
 }
 
-/// Xcode's bundled sourcekit-lsp, looked up once (spawning xcrun is slow).
 fn xcode_sourcekit_lsp() -> Option<PathBuf> {
     static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
     FOUND
@@ -114,10 +91,6 @@ fn xcode_sourcekit_lsp() -> Option<PathBuf> {
         .clone()
 }
 
-/// The directory a server for `path` runs in. Inside the project: the
-/// nearest (Swift) or topmost (Rust) manifest directory below the project
-/// root, else the project root itself. Outside it (std sources, generated
-/// interfaces) there is no answer; the caller reuses a running server.
 fn root_for(kind: Kind, project: &Path, path: &Path) -> Option<PathBuf> {
     if !path.starts_with(project) {
         return None;
@@ -130,8 +103,6 @@ fn root_for(kind: Kind, project: &Path, path: &Path) -> Option<PathBuf> {
     let found = if kind.prefers_topmost() { manifests.last() } else { manifests.next() };
     Some(found.unwrap_or(project).to_path_buf())
 }
-
-// ---- URIs and positions ---------------------------------------------------
 
 pub fn path_to_uri(path: &Path) -> String {
     let mut out = String::from("file://");
@@ -146,17 +117,14 @@ pub fn path_to_uri(path: &Path) -> String {
 
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
-    // Drop an authority ("file://localhost/…"); paths start at the next '/'.
     let rest = &rest[rest.find('/')?..];
     Some(PathBuf::from(crate::percent_decode(rest)))
 }
 
-/// UTF-16 column (LSP's default unit) of the `chars`-th character of `line`.
 fn utf16_column(line: &str, chars: u32) -> u32 {
     line.chars().take(chars as usize).map(|c| c.len_utf16() as u32).sum()
 }
 
-/// Character column (the editor's unit) of UTF-16 column `utf16` in `line`.
 pub fn char_column(line: &str, utf16: u32) -> u32 {
     let mut units = 0;
     let mut chars = 0;
@@ -183,13 +151,10 @@ fn from_lsp(text: &Rope, pos: Position) -> Position {
     Position::new(pos.line, char_column(&line_text(text, pos.line), pos.character))
 }
 
-// ---- One server process -----------------------------------------------------
-
 type Reply = std::result::Result<Value, ServerError>;
 
 #[derive(Debug, Clone)]
 pub enum ServerError {
-    /// The server is still loading the project; asking again later works.
     Busy,
     Failed(String),
 }
@@ -205,11 +170,9 @@ impl std::fmt::Display for ServerError {
 
 impl std::error::Error for ServerError {}
 
-/// State the reader thread shares with the UI side.
 struct Shared {
     stdin: Mutex<ChildStdin>,
     pending: Mutex<HashMap<i64, flume::Sender<Reply>>>,
-    /// Open `$/progress` tokens: non-empty while the server is indexing.
     progress: Mutex<HashSet<String>>,
     stderr_tail: Mutex<Vec<String>>,
     exited: AtomicBool,
@@ -232,7 +195,6 @@ impl Shared {
         }
     }
 
-    /// Fails every waiting request; called once the process is gone.
     fn fail_pending(&self) {
         self.exited.store(true, Ordering::SeqCst);
         let reason = self.exit_reason();
@@ -245,10 +207,8 @@ impl Shared {
 pub struct Server {
     kind: Kind,
     shared: Arc<Shared>,
-    /// Messages for the writer, sent only after the initialize handshake.
     outgoing: flume::Sender<Value>,
     next_id: AtomicI64,
-    /// Open documents (by URI) and the version last sent.
     open: RefCell<HashMap<String, i32>>,
     last_used: Cell<Instant>,
     child: Child,
@@ -301,8 +261,6 @@ impl Server {
             reader.fail_pending();
         });
 
-        // The handshake happens on the writer thread, so `start` never blocks
-        // the UI; requests queued meanwhile go out once it completes.
         let (outgoing, queue) = flume::unbounded::<Value>();
         let (init_reply, init_done) = flume::bounded(1);
         shared.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(0, init_reply);
@@ -386,7 +344,6 @@ impl Server {
         receiver
     }
 
-    /// Opens the document, or sends its text again when edited since.
     fn sync(&self, uri: &str, stale: bool, text: impl FnOnce() -> String) {
         let mut open = self.open.borrow_mut();
         match open.get_mut(uri) {
@@ -422,8 +379,6 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        // Polite shutdown is not worth a round trip: the servers keep no
-        // state that a kill loses, and both also exit when stdin closes.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -455,7 +410,6 @@ fn dispatch(shared: &Shared, message: Value) {
     let method = message.get("method").and_then(Value::as_str);
     let id = message.get("id").cloned();
     match (method, id) {
-        // A reply to one of ours.
         (None, Some(id)) => {
             let Some(id) = id.as_i64() else { return };
             let Some(reply) = shared.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) else { return };
@@ -472,8 +426,6 @@ fn dispatch(shared: &Shared, message: Value) {
             };
             let _ = reply.send(result);
         }
-        // A request from the server (progress tokens, configuration,
-        // registrations): accept it with an empty answer.
         (Some(method), Some(id)) => {
             let result = match method {
                 "workspace/configuration" => {
@@ -520,22 +472,16 @@ fn into_links(response: Option<GotoDefinitionResponse>) -> Vec<LocationLink> {
     }
 }
 
-// ---- Per-window manager ------------------------------------------------------
-
-/// The servers of one workspace window, keyed by language and root.
 #[derive(Default)]
 pub struct Manager {
     project: RefCell<Option<PathBuf>>,
     servers: RefCell<HashMap<(Kind, PathBuf), Rc<Server>>>,
-    /// Start failures, reported once instead of retried on every hover.
     failed: RefCell<HashMap<Kind, String>>,
-    /// The root last used per language, for files outside the project.
     last_root: RefCell<HashMap<Kind, PathBuf>>,
     reaper: RefCell<Option<Task<()>>>,
 }
 
 impl Manager {
-    /// A new project: drops every server of the previous one.
     pub fn set_project(&self, root: Option<PathBuf>) {
         *self.project.borrow_mut() = root;
         self.servers.borrow_mut().clear();
@@ -581,7 +527,6 @@ impl Manager {
         Ok(server)
     }
 
-    /// Re-arms the idle timer; replacing the task cancels the previous one.
     fn arm_reaper(self: &Rc<Self>, cx: &mut App) {
         let manager = Rc::downgrade(self);
         *self.reaper.borrow_mut() = Some(cx.spawn(async move |cx| {
@@ -592,7 +537,6 @@ impl Manager {
         }));
     }
 
-    /// The tab for `path` closed.
     pub fn close(&self, path: &Path) {
         let uri = path_to_uri(path);
         for server in self.servers.borrow().values() {
@@ -600,18 +544,15 @@ impl Manager {
         }
     }
 
-    /// Whether any server of `kind` is still loading its project.
     pub fn indexing(&self, kind: Kind) -> bool {
         self.servers.borrow().values().any(|s| s.kind == kind && s.alive() && s.indexing())
     }
 }
 
-/// Answers the editor's definition requests for one document.
 pub struct Definitions {
     pub manager: Weak<Manager>,
     pub kind: Kind,
     pub path: PathBuf,
-    /// Set on every edit; cleared when the text is sent to the server.
     pub stale: Rc<Cell<bool>>,
 }
 
@@ -639,7 +580,6 @@ impl DefinitionProvider for Definitions {
             let value = reply.recv_async().await.map_err(|_| anyhow!("language server stopped"))??;
             let response = serde_json::from_value::<Option<GotoDefinitionResponse>>(value)?;
             let mut links = into_links(response);
-            // The editor underlines the origin range in characters.
             for link in &mut links {
                 if let Some(range) = link.origin_selection_range.as_mut() {
                     *range = Range::new(from_lsp(&text, range.start), from_lsp(&text, range.end));
@@ -666,7 +606,6 @@ mod tests {
 
     #[test]
     fn columns_convert_between_chars_and_utf16() {
-        // "😀" is one char and two UTF-16 units.
         let line = "let 😀 = x";
         assert_eq!(utf16_column(line, 5), 6);
         assert_eq!(char_column(line, 6), 5);
@@ -711,7 +650,6 @@ mod tests {
         assert!(into_links(serde_json::from_value(Value::Null).unwrap()).is_empty());
     }
 
-    /// Talks to the real sourcekit-lsp: `cargo test -- --ignored sourcekit`.
     #[test]
     #[ignore]
     fn sourcekit_finds_foundation_interface() {

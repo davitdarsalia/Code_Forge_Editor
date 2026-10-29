@@ -1,17 +1,6 @@
-//! Language pack: grammars on top of the ones gpui-component ships.
-//!
-//! Each entry is a tree-sitter grammar crate plus its highlight queries. To add
-//! a language: add the crate to Cargo.toml, add a line here, and map its file
-//! extensions in `files::language_for`.
-//!
-//! A few formats have no published grammar crate; those live in `grammars/`
-//! (grammar.js + generated parser.c, compiled by build.rs) with highlight
-//! queries in `assets/queries/`.
-
 use gpui_kit::component::highlighter::{GrammarConfig, LanguageRegistry};
 use tree_sitter_language::LanguageFn;
 
-// Entry points of the in-repo grammars compiled by build.rs.
 unsafe extern "C" {
     fn tree_sitter_openstep_plist() -> *const ();
     fn tree_sitter_xcconfig() -> *const ();
@@ -34,7 +23,6 @@ struct Grammar {
 
 fn grammars() -> Vec<Grammar> {
     vec![
-        // Android manifests, layouts, resources, plists.
         Grammar {
             name: "xml",
             language: tree_sitter_xml::LANGUAGE_XML.into(),
@@ -42,7 +30,6 @@ fn grammars() -> Vec<Grammar> {
             injections: "",
             locals: "",
         },
-        // build.gradle, Jenkinsfile.
         Grammar {
             name: "groovy",
             language: tree_sitter_groovy::LANGUAGE.into(),
@@ -50,7 +37,6 @@ fn grammars() -> Vec<Grammar> {
             injections: "",
             locals: "",
         },
-        // gradle.properties, local.properties.
         Grammar {
             name: "properties",
             language: tree_sitter_properties::LANGUAGE.into(),
@@ -79,7 +65,6 @@ fn grammars() -> Vec<Grammar> {
             injections: "",
             locals: tree_sitter_dart::LOCALS_QUERY,
         },
-        // gradlew.bat and other Windows scripts.
         Grammar {
             name: "batch",
             language: tree_sitter_batch::LANGUAGE.into(),
@@ -87,7 +72,6 @@ fn grammars() -> Vec<Grammar> {
             injections: "",
             locals: "",
         },
-        // Old-style plists: project.pbxproj, Localizable.strings.
         Grammar {
             name: "openstep_plist",
             language: OPENSTEP_PLIST.into(),
@@ -102,7 +86,6 @@ fn grammars() -> Vec<Grammar> {
             injections: "",
             locals: "",
         },
-        // proguard-rules.pro, consumer-rules.pro.
         Grammar {
             name: "proguard",
             language: PROGUARD.into(),
@@ -110,7 +93,6 @@ fn grammars() -> Vec<Grammar> {
             injections: "",
             locals: "",
         },
-        // .gitignore, .dockerignore and similar pattern files.
         Grammar {
             name: "gitignore",
             language: GITIGNORE.into(),
@@ -156,7 +138,6 @@ mod tests {
         parser.parse(source, None).expect("parse")
     }
 
-    /// Captures `name`'s highlight query assigns in `source`, as (text, capture).
     fn captures(name: &str, source: &str) -> Vec<(String, String)> {
         use tree_sitter::StreamingIterator;
         let grammar = grammars().into_iter().find(|g| g.name == name).expect(name);

@@ -88,8 +88,6 @@ pub struct OpenRecent {
     pub path: PathBuf,
 }
 
-/// Every open project window, so app-level actions (menus, shortcuts) can
-/// reach the workspace of whichever window is in front.
 #[derive(Default)]
 struct AppState {
     windows: Vec<(AnyWindowHandle, WeakEntity<Workspace>)>,
@@ -98,13 +96,11 @@ struct AppState {
 
 impl Global for AppState {}
 
-/// Paths handed to the app by Finder ("Open With", dock drops).
 fn open_requests() -> &'static (flume::Sender<Vec<PathBuf>>, flume::Receiver<Vec<PathBuf>>) {
     static CHANNEL: OnceLock<(flume::Sender<Vec<PathBuf>>, flume::Receiver<Vec<PathBuf>>)> = OnceLock::new();
     CHANNEL.get_or_init(flume::unbounded)
 }
 
-/// Bundles the default component icons plus a few extra Lucide icons.
 struct Assets;
 
 const EXTRA_ICONS: &[(&str, &[u8])] = &[
@@ -135,8 +131,6 @@ impl AssetSource for Assets {
     }
 }
 
-/// The workspace window actions should go to: the key window if it is a
-/// project window, else the frontmost project window, else the newest one.
 fn target_workspace(cx: &App) -> Option<(AnyWindowHandle, WeakEntity<Workspace>)> {
     let state = cx.try_global::<AppState>()?;
     let live = |handle: AnyWindowHandle| {
@@ -163,10 +157,6 @@ fn update_workspace(
     }
 }
 
-/// Runs `f` on the front workspace. Deferred because action handlers run
-/// while the dispatching window is leased out of the app: updating that same
-/// window synchronously fails ("window not found"), which is what made menu
-/// items such as Open Recent silently do nothing.
 fn with_workspace(cx: &mut App, f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static) {
     cx.defer(move |cx| {
         if let Some(target) = target_workspace(cx) {
@@ -175,8 +165,6 @@ fn with_workspace(cx: &mut App, f: impl FnOnce(&mut Workspace, &mut Window, &mut
     });
 }
 
-/// Like `with_workspace`, but opens a fresh window when none is left (macOS
-/// apps keep running after their last window closes).
 fn with_workspace_or_new(
     cx: &mut App,
     f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
@@ -191,7 +179,6 @@ fn with_workspace_or_new(
 fn window_options(cx: &App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
     let window_bounds = if Settings::get(cx).launch_full_screen {
-        // Zoomed to fill the screen like Xcode, not a separate fullscreen Space.
         WindowBounds::Maximized(bounds)
     } else {
         WindowBounds::Windowed(bounds)
@@ -203,7 +190,6 @@ fn window_options(cx: &App) -> WindowOptions {
     }
 }
 
-/// Opens a new project window on the welcome screen and registers it.
 fn open_workspace_window(cx: &mut App) -> Option<(AnyWindowHandle, WeakEntity<Workspace>)> {
     let options = window_options(cx);
     match gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(window, cx))) {
@@ -253,7 +239,6 @@ fn open_settings(cx: &mut App) {
     }
 }
 
-/// ⌘W in the Settings window closes it instead of a tab elsewhere.
 fn close_settings_if_active(cx: &mut App) -> bool {
     let settings = cx.try_global::<AppState>().and_then(|s| s.settings_window);
     let Some(window) = settings.filter(|w| cx.active_window() == Some(*w)) else { return false };
@@ -330,7 +315,6 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Focus Terminal", FocusTerminal),
             MenuItem::action("New Terminal", NewTerminal),
         ]),
-        // Open Quickly lives in File only (as in Xcode), not duplicated here.
         Menu::new("Find").items([MenuItem::action("Find in Project…", FindInProject)]),
         Menu::new("Navigate").items([
             MenuItem::action("Reveal in Navigator", RevealInNavigator),
@@ -365,7 +349,6 @@ pub fn set_menus(cx: &mut App) {
 
 fn register_actions(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| {
-        // Deferred so the window that dispatched ⌘Q is not leased while saving.
         cx.defer(|cx| {
             let windows = cx.try_global::<AppState>().map(|s| s.windows.clone()).unwrap_or_default();
             for target in windows.into_iter().filter(|(_, ws)| ws.upgrade().is_some()) {
@@ -466,7 +449,6 @@ fn register_actions(cx: &mut App) {
     cx.on_action(|_: &GitPull, cx| with_workspace(cx, |ws, window, cx| ws.run_remote("Pull", git::pull, window, cx)));
     cx.on_action(|_: &GitPush, cx| with_workspace(cx, |ws, window, cx| ws.run_remote("Push", git::push, window, cx)));
     cx.on_action(|_: &GitFetch, cx| with_workspace(cx, |ws, window, cx| ws.run_remote("Fetch", git::fetch, window, cx)));
-    // Window menu: acts on whichever window is in front (Settings included).
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
 
@@ -483,16 +465,8 @@ fn register_actions(cx: &mut App) {
     cx.bind_keys(key_bindings());
 }
 
-/// Every app shortcut. The command palette's hints (`commands.rs`) are
-/// checked against this list by a test.
-///
-/// Keybindings dispatch before key-down listeners, so these also fire while
-/// the terminal is focused. The menu shows the FIRST binding of an action,
-/// so the canonical one is listed first and fallbacks after.
 fn key_bindings() -> Vec<KeyBinding> {
     vec![
-        // Global (no context): nothing in the editor's "Input" context binds
-        // cmd-i, so this reaches the app handler from inside the editor too.
         KeyBinding::new("cmd-i", FormatFile, None),
         KeyBinding::new("cmd-shift-b", Build, None),
         KeyBinding::new("cmd-shift-k", CleanBuild, None),
@@ -501,7 +475,6 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-shift-n", NewWindow, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
-        // ⌘P first so menus show it; ⇧⌘O is the Xcode alias.
         KeyBinding::new("cmd-p", QuickOpenFile, None),
         KeyBinding::new("cmd-shift-o", QuickOpenFile, None),
         KeyBinding::new("cmd-shift-f", FindInProject, None),
@@ -540,11 +513,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-alt-p", GitPush, None),
         KeyBinding::new("cmd-alt-f", GitFetch, None),
         KeyBinding::new("cmd-m", Minimize, None),
-        // The text input binds ⌘⇧F to Replace in its "Input" context, which
-        // outranks context-free bindings; re-bind it there (added later, so it
-        // wins) so Find in Project works from the editor too.
         KeyBinding::new("cmd-shift-f", FindInProject, Some("Input")),
-        // Same for ⌘. (the input maps it to code actions, which Forge has none of).
         KeyBinding::new("cmd-.", StopBuild, Some("Input")),
     ]
 }
@@ -582,8 +551,6 @@ fn main() {
 
         let Some(target) = open_workspace_window(cx) else { return };
         startup::mark("window opened");
-        // Building the native menu bar costs ~20 ms the first time; nothing
-        // shows it before the window's first frame, so do it right after.
         update_workspace(cx, target.clone(), |_, window, _| {
             window.on_next_frame(|_, cx| {
                 set_menus(cx);
@@ -599,7 +566,6 @@ fn main() {
         update_workspace(cx, target, move |ws, window, cx| ws.open_paths(&initial, window, cx));
         startup::mark("open_paths returned");
 
-        // Finder requests that arrive while the app is running.
         cx.spawn(async move |cx| {
             while let Ok(paths) = open_requests().1.recv_async().await {
                 let _ = cx.update(|cx| {
@@ -612,8 +578,6 @@ fn main() {
     });
 }
 
-/// Decodes `%XX` escapes of a `file://` URL path. Works on bytes so a `%`
-/// followed by non-ASCII text cannot split a UTF-8 character.
 fn percent_decode(input: &str) -> String {
     let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     let bytes = input.as_bytes();
@@ -641,7 +605,6 @@ mod tests {
     fn percent_decode_handles_escapes_and_non_ascii() {
         assert_eq!(percent_decode("/Users/me/My%20Project"), "/Users/me/My Project");
         assert_eq!(percent_decode("/a/%C3%A9t%C3%A9"), "/a/été");
-        // A `%` before multi-byte text used to slice inside a char and panic.
         assert_eq!(percent_decode("/a/%é%"), "/a/%é%");
         assert_eq!(percent_decode("/a/100%"), "/a/100%");
         assert_eq!(percent_decode("/a/%zz"), "/a/%zz");

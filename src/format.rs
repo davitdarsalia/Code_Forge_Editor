@@ -1,18 +1,11 @@
-//! ⌘I "re-indent": runs an external formatter (stdin → stdout) for the file's
-//! language, falling back to a simple brace-depth re-indenter.
-//!
-//! Everything here is blocking and meant for the background executor.
-
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// A formatter that runs longer than this is killed.
 const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Where GUI-launched apps miss binaries because PATH is minimal.
 const EXTRA_BIN_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,8 +35,6 @@ impl Tool {
     }
 }
 
-/// Formatter candidates per language, in preference order, plus the install
-/// hint shown when none is found and whether the re-indenter is a safe fallback.
 struct Entry {
     language: &'static str,
     candidates: &'static [Tool],
@@ -66,7 +57,6 @@ const TABLE: &[Entry] = &[
     Entry { language: "yaml", candidates: &[Tool::Prettier], install: Some("`brew install prettier`"), reindent: false },
     Entry { language: "xml", candidates: &[Tool::Xmllint], install: Some("`brew install libxml2`"), reindent: false },
     Entry { language: "go", candidates: &[Tool::Gofmt], install: Some("`brew install go`"), reindent: true },
-    // Brace languages without a wired formatter: re-indent only.
     Entry { language: "java", candidates: &[], install: None, reindent: true },
     Entry { language: "c", candidates: &[], install: None, reindent: true },
     Entry { language: "cpp", candidates: &[], install: None, reindent: true },
@@ -79,19 +69,13 @@ const TABLE: &[Entry] = &[
     Entry { language: "zig", candidates: &[], install: None, reindent: true },
 ];
 
-/// What ⌘I will do for a file, decided before running anything.
 #[derive(Debug, PartialEq)]
 pub enum Plan {
-    /// Run this tool (resolved binary).
     External { tool: Tool, program: PathBuf },
-    /// Re-indent in Rust; `hint` is the install command for a better formatter.
     Reindent { hint: Option<String> },
-    /// Nothing safe to do.
     Unsupported { hint: Option<String> },
 }
 
-/// Pick a formatter. `resolve` maps a tool to its binary (None = not installed);
-/// `has_config` reports whether a config file name exists up the tree.
 pub fn plan(
     language: &str,
     resolve: &dyn Fn(Tool) -> Option<PathBuf>,
@@ -101,12 +85,11 @@ pub fn plan(
         return Plan::Unsupported { hint: None };
     };
     let mut order: Vec<Tool> = entry.candidates.to_vec();
-    // Respect whichever tool the project configured.
     if language == "swift" && has_config(".swiftformat") && !has_config(".swift-format") {
         order.reverse();
     }
     if language == "kotlin" && has_config(".editorconfig") {
-        order.reverse(); // ktlint reads .editorconfig, ktfmt ignores it.
+        order.reverse();
     }
     for tool in order {
         if let Some(program) = resolve(tool) {
@@ -120,15 +103,12 @@ pub fn plan(
     if entry.reindent { Plan::Reindent { hint } } else { Plan::Unsupported { hint } }
 }
 
-/// Outcome handed back to the UI thread.
 pub enum Outcome {
-    /// New text (already known to differ from the input) and an optional notice.
     Changed { text: String, notice: Option<String> },
     Unchanged { notice: Option<String> },
     Failed(String),
 }
 
-/// Formats `text` as the file at `path` would be formatted. Blocking.
 pub fn format(path: &Path, language: &str, text: &str) -> Outcome {
     let dir = path.parent().unwrap_or(Path::new("/")).to_path_buf();
     let plan = plan(language, &|tool| resolve(tool), &|name| find_up(&dir, name).is_some());
@@ -156,8 +136,6 @@ pub fn format(path: &Path, language: &str, text: &str) -> Outcome {
     }
 }
 
-// ---- Tool lookup ---------------------------------------------------------
-
 pub(crate) fn search_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
@@ -174,7 +152,6 @@ pub(crate) fn which(name: &str) -> Option<PathBuf> {
     search_dirs().into_iter().map(|d| d.join(name)).find(|p| p.is_file())
 }
 
-/// Xcode's bundled swift-format, looked up once (spawning xcrun is slow).
 fn xcode_swift_format() -> Option<PathBuf> {
     static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
     FOUND
@@ -193,12 +170,9 @@ fn resolve(tool: Tool) -> Option<PathBuf> {
     }
 }
 
-/// Nearest `name` in `dir` or any ancestor.
 fn find_up(dir: &Path, name: &str) -> Option<PathBuf> {
     dir.ancestors().map(|d| d.join(name)).find(|p| p.exists())
 }
-
-// ---- Running ---------------------------------------------------------------
 
 fn run_tool(tool: Tool, program: &Path, path: &Path, text: &str) -> Result<String, String> {
     let dir = path.parent().unwrap_or(Path::new("/"));
@@ -214,7 +188,6 @@ fn run_tool(tool: Tool, program: &Path, path: &Path, text: &str) -> Result<Strin
         }
         Tool::NickSwiftFormat => args.extend(["stdin".into(), "--stdinpath".into(), file, "--quiet".into()]),
         Tool::Ktfmt => {
-            // ktfmt defaults to Google style (2 spaces); Kotlin projects expect 4.
             args.extend(["--kotlinlang-style".into(), "-".into()]);
         }
         Tool::Ktlint => args.extend(["--format".into(), "--stdin".into(), "--stdin-path".into(), file, "--log-level=none".into()]),
@@ -228,7 +201,6 @@ fn run_tool(tool: Tool, program: &Path, path: &Path, text: &str) -> Result<Strin
     }
     let output = run_with_timeout(program, &args, dir, text, FORMAT_TIMEOUT)?;
     if tool == Tool::Xmllint && !text.trim_start().starts_with("<?xml") {
-        // xmllint adds a declaration the file did not have.
         if let Some(rest) = output.strip_prefix("<?xml version=\"1.0\"?>\n") {
             return Ok(rest.to_string());
         }
@@ -236,7 +208,6 @@ fn run_tool(tool: Tool, program: &Path, path: &Path, text: &str) -> Result<Strin
     Ok(output)
 }
 
-/// Edition from the nearest Cargo.toml, so rustfmt parses new syntax.
 fn rust_edition(dir: &Path) -> String {
     find_up(dir, "Cargo.toml")
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -257,7 +228,6 @@ fn run_with_timeout(
     timeout: Duration,
 ) -> Result<String, String> {
     let name = program.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    // Node-based tools (prettier) need `node` on PATH even from a Finder launch.
     let path_env = std::env::join_paths(search_dirs()).unwrap_or_default();
     let mut child = Command::new(program)
         .args(args)
@@ -269,7 +239,6 @@ fn run_with_timeout(
         .spawn()
         .map_err(|err| format!("Cannot run {name}: {err}"))?;
 
-    // Feed and drain on threads so a large file cannot deadlock the pipes.
     let input_blank = input.trim().is_empty();
     let mut stdin = child.stdin.take();
     let input = input.to_owned();
@@ -327,10 +296,6 @@ fn run_with_timeout(
     Ok(out)
 }
 
-// ---- Indent unit (.editorconfig) ---------------------------------------------
-
-/// Indent string for the re-indenter: .editorconfig, else 4 spaces (tabs if
-/// the file already indents with tabs).
 fn indent_unit(path: &Path, text: &str) -> String {
     if let Some(unit) = editorconfig_indent(path) {
         return unit;
@@ -352,7 +317,6 @@ fn editorconfig_indent(path: &Path) -> Option<String> {
     for dir in path.parent()?.ancestors() {
         let Ok(text) = std::fs::read_to_string(dir.join(".editorconfig")) else { continue };
         let (s, z, root) = parse_editorconfig(&text, &name);
-        // Closer files win: only fill what is still unset.
         style = style.or(s);
         size = size.or(z);
         if root {
@@ -367,7 +331,6 @@ fn editorconfig_indent(path: &Path) -> Option<String> {
     }
 }
 
-/// (indent_style, indent_size, root) for `file_name` from one .editorconfig.
 fn parse_editorconfig(text: &str, file_name: &str) -> (Option<String>, Option<usize>, bool) {
     let (mut style, mut size, mut root) = (None, None, false);
     let mut matches = false;
@@ -387,7 +350,6 @@ fn parse_editorconfig(text: &str, file_name: &str) -> (Option<String>, Option<us
         if in_preamble {
             root |= key == "root" && value == "true";
         } else if matches {
-            // Later sections override earlier ones in the same file.
             match key.as_str() {
                 "indent_style" => style = Some(value),
                 "indent_size" => size = value.parse().ok().or(size),
@@ -398,8 +360,6 @@ fn parse_editorconfig(text: &str, file_name: &str) -> (Option<String>, Option<us
     (style, size, root)
 }
 
-/// Minimal editorconfig globs: `*`, `*.ext`, `*.{a,b}`, exact names; a path
-/// prefix (`**/`, `dir/`) is ignored.
 fn glob_matches(pattern: &str, name: &str) -> bool {
     let pattern = pattern.rsplit('/').next().unwrap_or(pattern);
     if pattern == "*" {
@@ -417,9 +377,6 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
     pattern == name
 }
 
-// ---- Re-indenter -----------------------------------------------------------
-
-/// Lexing state carried across lines.
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Code,
@@ -428,10 +385,6 @@ enum State {
     Backtick,
 }
 
-/// Re-indents brace languages by bracket depth. Strings and comments are left
-/// alone. Returns None when the structure is not understood (unbalanced or
-/// mismatched brackets, unterminated block string), so the text is never
-/// mangled.
 pub fn reindent(text: &str, unit: &str, language: &str) -> Option<String> {
     let crlf = text.contains("\r\n");
     let normalized;
@@ -441,13 +394,10 @@ pub fn reindent(text: &str, unit: &str, language: &str) -> Option<String> {
     } else {
         text
     };
-    // Where '...' is a string (else only a short char literal like 'a', '\n').
     let quote_strings = matches!(language, "groovy" | "javascript" | "typescript" | "tsx" | "json" | "css" | "php" | "dart" | "python");
     let triple = matches!(language, "groovy" | "kotlin" | "swift" | "scala" | "dart" | "java");
     let backtick = matches!(language, "javascript" | "typescript" | "tsx");
 
-    // Each open bracket remembers how much indent it contributed (0 or 1):
-    // several openers on one line indent the next line only once.
     let mut stack: Vec<(char, usize)> = Vec::new();
     let mut state = State::Code;
     let mut out = String::with_capacity(text.len() + text.len() / 8);
@@ -485,7 +435,6 @@ pub fn reindent(text: &str, unit: &str, language: &str) -> Option<String> {
 
         let mut min_len = stack.len();
         state = scan_line(line, state, &mut stack, &mut min_len, quote_strings, triple, backtick)?;
-        // Openers left open by this line: the first indents, the rest do not.
         for (i, entry) in stack.iter_mut().enumerate().skip(min_len) {
             entry.1 = usize::from(i == min_len);
         }
@@ -496,12 +445,10 @@ pub fn reindent(text: &str, unit: &str, language: &str) -> Option<String> {
     Some(if crlf { out.replace('\n', "\r\n") } else { out })
 }
 
-/// Chained calls and wrapped operators get one extra level.
 fn is_continuation(trimmed: &str) -> bool {
     (trimmed.starts_with('.') && !trimmed.starts_with("..")) || ["?.", "?:", "&&", "||"].iter().any(|p| trimmed.starts_with(p))
 }
 
-/// Advances the lexer over one line, pushing/popping brackets.
 fn scan_line(
     line: &str,
     mut state: State,
@@ -552,7 +499,6 @@ fn scan_line(
             State::Code => match c {
                 '/' if next == Some('/') => break,
                 '#' if i == 0 || chars[..i].iter().all(|c| c.is_whitespace()) => {
-                    // Preprocessor / shebang lines carry no brackets we care about.
                     break;
                 }
                 '/' if next == Some('*') => {
@@ -573,7 +519,6 @@ fn scan_line(
                     } else if let Some(end) = char_literal_end(&chars, i) {
                         i = end;
                     }
-                    // Otherwise a lone quote (Rust lifetime, Swift): ignore it.
                 }
                 '{' | '(' | '[' => stack.push((c, 1)),
                 '}' | ')' | ']' => {
@@ -596,8 +541,6 @@ fn scan_line(
     Some(state)
 }
 
-/// Index of the closing quote of a single-line string starting at `start`.
-/// An unterminated string ends the line (returns the last index).
 fn skip_string(chars: &[char], start: usize, quote: char) -> Option<usize> {
     let mut i = start + 1;
     while i < chars.len() {
@@ -610,7 +553,6 @@ fn skip_string(chars: &[char], start: usize, quote: char) -> Option<usize> {
     Some(chars.len())
 }
 
-/// `'a'`, `'\n'`, `'\u{1F600}'`: the closing quote's index.
 fn char_literal_end(chars: &[char], start: usize) -> Option<usize> {
     match chars.get(start + 1)? {
         '\\' => (start + 3..chars.len().min(start + 12)).find(|&j| chars[j] == '\''),
@@ -646,7 +588,6 @@ mod tests {
     #[test]
     fn kotlin_chains_and_lambdas() {
         let input = "fun main() {\nlistOf(1).map {\nit * 2\n}\n.forEach({ x ->\nprintln(x)\n})\nif (a) {\n} else {\nb()\n}\n}";
-        // Simple by design: the continuation level is not carried into the lambda.
         let want = "fun main() {\n    listOf(1).map {\n        it * 2\n    }\n        .forEach({ x ->\n        println(x)\n    })\n    if (a) {\n    } else {\n        b()\n    }\n}";
         assert_eq!(reindent(input, "    ", "kotlin").unwrap(), want);
     }
@@ -699,7 +640,6 @@ mod tests {
         let resolve = only(&[Tool::SwiftFormat, Tool::NickSwiftFormat]);
         let plan = plan("swift", &resolve, &|name| name == ".swiftformat");
         assert!(matches!(plan, Plan::External { tool: Tool::NickSwiftFormat, .. }));
-        // Falls back to swift-format when nicklockwood's tool is missing.
         let plan = super::plan("swift", &only(&[Tool::SwiftFormat]), &|name| name == ".swiftformat");
         assert!(matches!(plan, Plan::External { tool: Tool::SwiftFormat, .. }));
     }

@@ -1,8 +1,3 @@
-//! One size knob for every icon in the app (Settings ▸ Icon size).
-//!
-//! Render code all over the app draws icons without access to the settings
-//! global, so the current scale is mirrored into a process-wide atomic.
-
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use gpui_kit::assets::IconName;
@@ -22,17 +17,14 @@ pub fn set_scale(scale: f32) {
     SCALE_BITS.store(scale.clamp(SCALE_RANGE.0, SCALE_RANGE.1).to_bits(), Ordering::Relaxed);
 }
 
-/// `base` is the size at 100%.
 pub fn scaled(base: f32) -> Pixels {
     px((base * scale()).round())
 }
 
-/// A tinted UI glyph (chevrons, toolbar buttons) at the user's icon size.
 pub fn ui_icon(name: IconName, base: f32, color: Hsla) -> Icon {
     Icon::new(name).size(scaled(base)).text_color(color)
 }
 
-/// Rows holding an icon grow with it so large icons never clip.
 pub fn row_height(base_row: f32, base_icon: f32) -> f32 {
     base_row.max((base_icon * scale()).round() + 6.)
 }

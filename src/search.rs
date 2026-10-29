@@ -1,9 +1,3 @@
-//! Project file index and full-text search, built on ripgrep's crates.
-//!
-//! Indexing walks the tree in parallel (respecting .gitignore). Search reuses
-//! the index and fans the file list out over every core; results stream back
-//! in batches so the UI fills in while the search is still running.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -15,14 +9,12 @@ use ignore::{WalkBuilder, WalkState};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-/// Results beyond this are dropped; nobody reads 20k matches.
 pub const MAX_MATCHES: usize = 20_000;
 const MAX_LINE_CHARS: usize = 240;
 const BATCH: usize = 8;
 
 pub struct FileIndex {
     pub root: PathBuf,
-    /// Paths relative to `root`, sorted.
     pub files: Vec<String>,
 }
 
@@ -46,7 +38,6 @@ fn walker(root: &Path) -> WalkBuilder {
     builder
 }
 
-/// Per-thread buffer that hands its paths over when the walker drops it.
 struct Collector {
     local: Vec<String>,
     tx: flume::Sender<Vec<String>>,
@@ -60,8 +51,6 @@ impl Drop for Collector {
     }
 }
 
-/// Live counters a running walk publishes for the status bar. Workers only
-/// touch atomics on the hot path; the folder name is updated now and then.
 #[derive(Default)]
 pub struct IndexProgress {
     pub files: AtomicUsize,
@@ -74,7 +63,6 @@ impl IndexProgress {
     }
 }
 
-/// Walks `root` on all cores and returns every non-ignored file.
 #[cfg(test)]
 pub fn build_index(root: &Path) -> FileIndex {
     build_index_with_progress(root, &IndexProgress::default())
@@ -92,8 +80,6 @@ pub fn build_index_with_progress(root: &Path, progress: &IndexProgress) -> FileI
                     collector.local.push(relative.to_string_lossy().into_owned());
                     progress.files.fetch_add(1, Ordering::Relaxed);
                 } else if entry.depth() <= 3 {
-                    // Shallow folders only: enough for a readable log line,
-                    // cheap enough to never contend.
                     if let Ok(mut dir) = progress.current_dir.try_lock() {
                         *dir = relative.to_string_lossy().into_owned();
                     }
@@ -108,11 +94,8 @@ pub fn build_index_with_progress(root: &Path, progress: &IndexProgress) -> FileI
     FileIndex { root: root.to_path_buf(), files }
 }
 
-// ---- Quick open (⌘P) --------------------------------------------------------
-
 pub struct FuzzyHit {
     pub ix: usize,
-    /// Char indices in the relative path that matched, for highlighting.
     pub indices: Vec<u32>,
 }
 
@@ -129,7 +112,6 @@ pub fn fuzzy(index: &FileIndex, query: &str, limit: usize) -> Vec<FuzzyHit> {
         .enumerate()
         .filter_map(|(ix, path)| {
             let score = pattern.score(Utf32Str::new(path, &mut buf), &mut matcher)?;
-            // Prefer shorter paths on ties: the file you mean is usually shallow.
             Some((score, ix))
         })
         .collect();
@@ -147,8 +129,6 @@ pub fn fuzzy(index: &FileIndex, query: &str, limit: usize) -> Vec<FuzzyHit> {
         .collect()
 }
 
-/// Fuzzy-ranks arbitrary labels (commands, symbols); `ix` points into `items`.
-/// An empty query keeps the original order.
 pub fn fuzzy_list<'a>(items: impl IntoIterator<Item = &'a str>, query: &str, limit: usize) -> Vec<FuzzyHit> {
     let items: Vec<&str> = items.into_iter().collect();
     if query.trim().is_empty() {
@@ -176,8 +156,6 @@ pub fn fuzzy_list<'a>(items: impl IntoIterator<Item = &'a str>, query: &str, lim
         .collect()
 }
 
-// ---- Full-text search -------------------------------------------------------
-
 #[derive(Clone, Copy, Default, PartialEq)]
 pub struct SearchOptions {
     pub case_sensitive: bool,
@@ -188,10 +166,8 @@ pub struct SearchOptions {
 #[derive(Clone)]
 pub struct LineMatch {
     pub line: u64,
-    /// Char column of the first match in the original line.
     pub column: usize,
     pub text: String,
-    /// Byte ranges inside `text`.
     pub ranges: Vec<(usize, usize)>,
 }
 
@@ -200,7 +176,6 @@ pub struct FileMatches {
     pub matches: Vec<LineMatch>,
 }
 
-/// Handle to a running search; dropping it does not stop it, `cancel` does.
 pub struct SearchHandle {
     cancelled: Arc<AtomicBool>,
 }
@@ -211,8 +186,6 @@ impl SearchHandle {
     }
 }
 
-/// Starts a parallel search over `index`. Batches of results arrive on the
-/// returned channel; it closes when every worker has finished.
 pub fn search(
     index: Arc<FileIndex>,
     query: &str,
@@ -280,7 +253,6 @@ pub fn search(
     Ok((SearchHandle { cancelled }, rx))
 }
 
-/// Long lines (minified files) are cut around the first match.
 fn clip_line(line: &str, ranges: Vec<(usize, usize)>) -> (String, Vec<(usize, usize)>) {
     let trimmed_start = line.len() - line.trim_start().len();
     let first = ranges.first().map_or(0, |r| r.0);
@@ -309,7 +281,6 @@ mod tests {
     use super::*;
 
     fn fixture() -> PathBuf {
-        // Unique per call: tests run in parallel and must not wipe each other's tree.
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("forge-search-{}-{n}", std::process::id()));
@@ -366,7 +337,6 @@ mod tests {
 mod bench {
     use super::*;
 
-    /// `FORGE_BENCH_ROOT=/some/repo cargo test --release bench -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn bench_index_and_search() {

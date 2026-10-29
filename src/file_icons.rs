@@ -1,24 +1,11 @@
-//! Full-color file-type icons for the tree, tabs, ⌘P and search results.
-//!
-//! GPUI's `svg()` element rasterizes an alpha mask and tints it with the text
-//! color, so multi-color SVGs lose their colors. `img()` instead decodes the
-//! SVG through resvg into an RGBA image (cached by the asset system after the
-//! first load), so the icons keep their own colors. The SVGs are embedded
-//! with `include_bytes!` and served by the app's `Assets` source.
-//! Regenerate the artwork with `scripts/gen_file_icons.py`.
-
 use std::path::Path;
 
 use gpui_kit::{Img, Styled as _, img};
 
-/// Icon edge in points at 100% (Settings ▸ Icon size scales it). The SVGs
-/// declare 32x32 so GPUI's 2x raster is 64 px: every scale up to 200% is
-/// drawn by downsampling, which stays sharp.
 pub const ICON_SIZE: f32 = 14.;
 
 macro_rules! icons {
     ($($name:literal),* $(,)?) => {
-        /// (asset path, bytes) for every bundled file icon.
         pub const ASSETS: &[(&str, &[u8])] = &[
             $((concat!("file-icons/", $name, ".svg"), include_bytes!(concat!("../assets/file-icons/", $name, ".svg")))),*
         ];
@@ -35,12 +22,10 @@ icons!(
     "folder-ios", "folder-ios-open", "folder-android", "folder-android-open", "folder-gradle", "folder-gradle-open",
 );
 
-/// A sized, full-color icon element for a file path.
 pub fn file_icon_img(path: &Path) -> Img {
     sized(file_icon(path))
 }
 
-/// A sized, full-color icon element for a directory.
 pub fn folder_icon_img(path: &Path, expanded: bool) -> Img {
     sized(folder_icon(path, expanded))
 }
@@ -49,16 +34,13 @@ fn sized(asset: &'static str) -> Img {
     img(asset).size(crate::icons::scaled(ICON_SIZE)).flex_none()
 }
 
-/// Asset path of the icon for a file. Exact names win over extensions.
 pub fn file_icon(path: &Path) -> &'static str {
     let name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     asset(file_kind(&name))
 }
 
-/// Asset path of the icon for a directory, open or closed.
 pub fn folder_icon(path: &Path, expanded: bool) -> &'static str {
     let name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    // Bundles that look like folders on disk but are documents in Xcode.
     if name.ends_with(".xcodeproj") {
         return asset("xcodeproj");
     }
@@ -81,7 +63,6 @@ fn asset(stem: &str) -> &'static str {
         .unwrap_or("file-icons/file.svg")
 }
 
-/// Icon stem for a lowercase file name.
 fn file_kind(name: &str) -> &'static str {
     match name {
         "dockerfile" | "containerfile" | ".dockerignore" => return "docker",
@@ -142,7 +123,6 @@ fn file_kind(name: &str) -> &'static str {
     }
 }
 
-/// Special-folder kind for a lowercase directory name, if any.
 fn folder_kind(name: &str) -> Option<&'static str> {
     let kind = match name {
         "src" | "source" | "sources" | "lib" | "java" | "kotlin" => "src",
@@ -162,7 +142,6 @@ fn folder_kind(name: &str) -> Option<&'static str> {
             if name.ends_with(".xcassets") || name.starts_with("drawable") || name.starts_with("mipmap") {
                 "assets"
             } else if name.ends_with("tests") || name.ends_with("test") {
-                // Xcode targets like "AppTests" / "AppUITests".
                 "test"
             } else {
                 return None;

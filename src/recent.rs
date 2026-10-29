@@ -1,5 +1,3 @@
-//! Recently opened projects, persisted as a small JSON list.
-
 use std::path::{Path, PathBuf};
 
 const MAX_RECENT: usize = 12;
@@ -15,7 +13,6 @@ pub fn load() -> Vec<PathBuf> {
     list.into_iter().filter(|p| p.exists()).collect()
 }
 
-/// Moves `project` to the front of the list and persists it.
 pub fn push(project: &Path) -> Vec<PathBuf> {
     let mut list = load();
     list.retain(|p| p != project);

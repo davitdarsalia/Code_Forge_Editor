@@ -1,7 +1,3 @@
-//! Build UI: the toolbar segment (build / stop / target picker), the "Build"
-//! tab of the bottom panel (streamed log + issues list) and the run state.
-//! Process and parsing logic lives in `build.rs`.
-
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -21,17 +17,13 @@ use crate::build::{
 use crate::file_icons;
 use crate::theme::{MONO_FONT, Palette, ca};
 
-/// Oldest log lines are dropped past this; issues are kept regardless.
 const MAX_LOG_LINES: usize = 20_000;
-/// Longer lines (xcodebuild prints multi-KB compiler invocations) are cut to
-/// this many bytes in the log view; issues are parsed from the full line first.
 const MAX_LINE_BYTES: usize = 2_048;
 const LOG_ROW_HEIGHT: f32 = 17.;
 const ISSUE_ROW_HEIGHT: f32 = 24.;
 
 pub enum BuildEvent {
     Open { path: PathBuf, line: u32, column: u32 },
-    /// A run started: the workspace reveals the Build tab.
     Started,
 }
 
@@ -54,7 +46,6 @@ pub struct BuildPanel {
     root: Option<PathBuf>,
     projects: Vec<BuildProject>,
     detecting: bool,
-    /// Selected project index and unit (scheme or module).
     selected: Option<(usize, Option<String>)>,
     simulators: Vec<Destination>,
     destination: Destination,
@@ -77,9 +68,6 @@ pub struct BuildPanel {
 
 impl EventEmitter<BuildEvent> for BuildPanel {}
 
-/// Closing the window (or quitting, which drops every window) must not leave
-/// xcodebuild/Gradle running: the build sits in its own process group, so no
-/// terminal hangup reaches it.
 impl Drop for BuildPanel {
     fn drop(&mut self) {
         if let Some(run) = self.run.take() {
@@ -115,10 +103,6 @@ impl BuildPanel {
         }
     }
 
-    // ---- Detection -------------------------------------------------------
-
-    /// Called on project open: detects build roots in the background, then
-    /// lists Xcode schemes (slow) per project.
     pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.abandon_run(cx);
         self.root = Some(root.clone());
@@ -173,7 +157,6 @@ impl BuildPanel {
                         }
                         Err(err) => eprintln!("forge: cannot list schemes of {}: {err}", project.dir.display()),
                     }
-                    // Upgrade a "whole project" selection to the preferred scheme.
                     if this.selected.as_ref().is_some_and(|(p, unit)| *p == ix && unit.is_none()) {
                         this.selected = Some((ix, preferred_unit(&this.projects[ix])));
                     }
@@ -188,7 +171,6 @@ impl BuildPanel {
         self.sim_task = Some(cx.spawn(async move |this, cx| {
             let sims = task.await;
             let _ = this.update(cx, |this, cx| {
-                // Keep the user's pick if that simulator is still booted.
                 if !sims.contains(&this.destination) && this.destination.spec.contains(",id=") {
                     this.destination = Destination::generic_simulator();
                 }
@@ -199,7 +181,6 @@ impl BuildPanel {
     }
 
     fn select_default(&mut self) {
-        // Prefer an app: an Xcode project, else a Gradle build with an app module.
         let ix = self
             .projects
             .iter()
@@ -248,7 +229,6 @@ impl BuildPanel {
         Some((self.projects.get(*ix)?, unit.as_deref()))
     }
 
-    /// Picker label, e.g. "DMote ▸ iPhone 16" or "D-Mote ▸ app".
     fn target_label(&self) -> SharedString {
         match self.selected_project() {
             Some((project, unit)) if project.is_xcode() => {
@@ -261,10 +241,6 @@ impl BuildPanel {
         }
     }
 
-    // ---- Running ---------------------------------------------------------
-
-    /// Whether an Xcode or Gradle project was found (the toolbar segment is
-    /// hidden otherwise).
     pub fn has_projects(&self) -> bool {
         !self.projects.is_empty()
     }
@@ -273,7 +249,6 @@ impl BuildPanel {
         matches!(self.state, RunState::Running { .. })
     }
 
-    /// Starts `action` on the selected target, stopping any run in flight.
     pub fn start(&mut self, action: BuildAction, cx: &mut Context<Self>) {
         self.picker_open = false;
         let Some((project, unit)) = self.selected_project() else {
@@ -312,7 +287,6 @@ impl BuildPanel {
         self.state = RunState::Running { action, name };
         cx.emit(BuildEvent::Started);
         self.run_task = Some(cx.spawn(async move |this, cx| {
-            // Each wake drains everything queued: one UI update per burst.
             while let Ok(first) = rx.recv_async().await {
                 let mut batch = vec![first];
                 batch.extend(rx.drain());
@@ -381,8 +355,6 @@ impl BuildPanel {
         self.log.push_back(line);
     }
 
-    /// Stops the running process group; its exit arrives as a normal event
-    /// and turns the state into "stopped".
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         let Some(run) = self.run.as_ref() else { return };
         if !self.stopping {
@@ -392,7 +364,6 @@ impl BuildPanel {
         }
     }
 
-    /// Stops the current run and ignores whatever it still prints.
     fn abandon_run(&mut self, cx: &mut Context<Self>) {
         self.stop(cx);
         self.run = None;
@@ -402,7 +373,6 @@ impl BuildPanel {
         }
     }
 
-    /// Text for the toolbar activity pill; `None` when nothing to say.
     pub fn status(&self) -> Option<(SharedString, bool)> {
         let counts = |errors: usize, warnings: usize| -> String {
             let mut parts = Vec::new();
@@ -454,8 +424,6 @@ fn preferred_unit(project: &BuildProject) -> Option<String> {
     }
 }
 
-// ---- Rendering --------------------------------------------------------------
-
 fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
     crate::icons::ui_icon(name, size, color)
 }
@@ -483,7 +451,6 @@ fn segment_button(
         .into_any_element()
 }
 
-/// The Xcode-like toolbar segment: ▶ build, ■ stop, target picker.
 pub fn toolbar_segment(build: &Entity<BuildPanel>, cx: &App) -> AnyElement {
     let panel = build.read(cx);
     let running = panel.is_running();
@@ -496,9 +463,7 @@ pub fn toolbar_segment(build: &Entity<BuildPanel>, cx: &App) -> AnyElement {
         .items_center()
         .gap(px(2.))
         .mr(px(8.))
-        // Keep clicks off the toolbar, whose double-click zooms the window.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        // Same path as ⇧⌘B / ⌘. so the toolbar also saves open files first.
         .child(segment_button("build-run", IconName::Play, has_target, |window, cx| {
             window.dispatch_action(Box::new(crate::Build), cx)
         }))
@@ -778,7 +743,6 @@ impl Render for BuildPanel {
     }
 }
 
-/// Cuts `line` to `MAX_LINE_BYTES` (on a char boundary) and marks the cut.
 fn truncate_line(line: SharedString) -> SharedString {
     if line.len() <= MAX_LINE_BYTES {
         return line;

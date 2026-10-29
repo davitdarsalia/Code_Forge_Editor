@@ -1,7 +1,3 @@
-//! Compiles the in-repo tree-sitter grammars under `grammars/` (generated
-//! `parser.c` files; regenerate with `tree-sitter generate --abi 14` in the
-//! grammar's folder after editing its `grammar.js`).
-
 const GRAMMARS: &[&str] = &["openstep_plist", "xcconfig", "proguard", "gitignore"];
 
 fn main() {

@@ -1,11 +1,3 @@
-//! Git access. Local operations (status, log, index edits, commit, discard)
-//! run in-process through libgit2 (`git2`), which avoids spawning a process
-//! per refresh. Network operations (fetch/pull/push/clone) still shell out to
-//! the `git` CLI because they need the user's credential helpers, ssh-agent and
-//! ssh config, which libgit2 does not pick up on its own.
-//!
-//! Every call is blocking and meant to run on the background executor.
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,8 +11,6 @@ use git2::{
 
 const LOG_LIMIT: usize = 40;
 
-/// Hooks that `git commit` would run. If any exists we commit through the CLI
-/// so the user's hooks still fire (libgit2 never runs hooks).
 const COMMIT_HOOKS: [&str; 4] = ["pre-commit", "prepare-commit-msg", "commit-msg", "post-commit"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +38,6 @@ impl FileStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Change {
-    /// Relative to the repository's work tree.
     pub path: PathBuf,
     pub status: FileStatus,
     pub staged: bool,
@@ -64,21 +53,16 @@ pub struct Commit {
 
 #[derive(Clone, Debug, Default)]
 pub struct RepoState {
-    /// Absolute work tree root; change paths are relative to it.
     pub workdir: PathBuf,
     pub branch: Option<String>,
     pub ahead: u32,
     pub behind: u32,
-    /// Index vs HEAD.
     pub staged: Vec<Change>,
-    /// Work tree vs index, plus untracked files and conflicts.
     pub unstaged: Vec<Change>,
     pub log: Vec<Commit>,
 }
 
 impl RepoState {
-    /// Absolute path -> status, used to color the file tree. The work tree
-    /// status wins over the staged one since it is what's on disk.
     pub fn status_map(&self) -> HashMap<PathBuf, FileStatus> {
         let mut map: HashMap<PathBuf, FileStatus> = self
             .staged
@@ -89,21 +73,16 @@ impl RepoState {
         map
     }
 
-    /// Number of distinct changed files (a file can be both staged and modified).
     pub fn file_count(&self) -> usize {
         let unstaged: HashSet<&Path> = self.unstaged.iter().map(|u| u.path.as_path()).collect();
         unstaged.len() + self.staged.iter().filter(|s| !unstaged.contains(s.path.as_path())).count()
     }
 
-    /// Everything the file tree and navigator badge need, computed once per
-    /// status read (off the UI thread) so rendering is lookups only.
     pub fn tree_marks(&self) -> TreeMarks {
         let files = self.status_map();
         let mut dirs = HashSet::new();
         for path in files.keys() {
             for dir in path.ancestors().skip(1) {
-                // Stop at the work tree root and at directories already
-                // recorded (their ancestors are recorded too).
                 if !dir.starts_with(&self.workdir) || !dirs.insert(dir.to_path_buf()) {
                     break;
                 }
@@ -113,14 +92,10 @@ impl RepoState {
     }
 }
 
-/// Precomputed git decorations for the file tree.
 #[derive(Debug, Default)]
 pub struct TreeMarks {
-    /// Absolute path -> status (see `RepoState::status_map`).
     pub files: HashMap<PathBuf, FileStatus>,
-    /// Every directory, up to the work tree root, that contains a change.
     pub dirs: HashSet<PathBuf>,
-    /// Distinct changed files (`RepoState::file_count`).
     pub change_count: usize,
 }
 
@@ -132,9 +107,6 @@ fn workdir(repo: &Repository) -> Result<PathBuf> {
     repo.workdir().map(Path::to_path_buf).context("bare repositories are not supported")
 }
 
-/// libgit2 reports the work tree with symlinks resolved; express it through
-/// the caller's spelling of `dir` (or its ancestor) so absolute paths line up
-/// with the file tree's.
 fn workdir_as_seen_from(dir: &Path, workdir: &Path) -> PathBuf {
     let Ok(target) = workdir.canonicalize() else { return workdir.to_path_buf() };
     dir.ancestors()
@@ -164,7 +136,6 @@ pub fn read_state(dir: &Path) -> Result<RepoState> {
         if status.is_ignored() {
             continue;
         }
-        // Renames report the new path through the head-to-index delta.
         let path = entry
             .head_to_index()
             .and_then(|delta| delta.new_file().path().map(Path::to_path_buf))
@@ -187,7 +158,6 @@ pub fn read_state(dir: &Path) -> Result<RepoState> {
     Ok(state)
 }
 
-/// Splits a libgit2 status into its (index, work tree) halves.
 fn classify(status: Status) -> (Option<FileStatus>, Option<FileStatus>) {
     if status.is_conflicted() {
         return (None, Some(FileStatus::Conflicted));
@@ -221,7 +191,6 @@ fn read_branch(repo: &Repository, state: &mut RepoState) {
     let head = match repo.head() {
         Ok(head) => head,
         Err(err) if err.code() == ErrorCode::UnbornBranch => {
-            // No commits yet: HEAD is a symbolic ref to a branch that doesn't exist.
             state.branch = repo
                 .find_reference("HEAD")
                 .ok()
@@ -252,7 +221,6 @@ fn read_branch(repo: &Repository, state: &mut RepoState) {
 fn read_log(repo: &Repository) -> Result<Vec<Commit>> {
     let mut walk = repo.revwalk()?;
     if let Err(err) = walk.push_head() {
-        // An unborn branch simply has no history.
         if err.code() == ErrorCode::UnbornBranch || err.code() == ErrorCode::NotFound {
             return Ok(Vec::new());
         }
@@ -278,7 +246,6 @@ fn oid_short(oid: git2::Oid) -> String {
     oid.to_string()[..7].to_string()
 }
 
-/// "3 hours ago", in the spirit of git's `%ar`.
 pub fn relative_time(now: i64, then: i64) -> String {
     let secs = (now - then).max(0);
     let (n, unit) = match secs {
@@ -293,9 +260,6 @@ pub fn relative_time(now: i64, then: i64) -> String {
     format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
-// ---- Index ------------------------------------------------------------------
-
-/// `git add <path>` (also records deletions and resolves conflicts).
 pub fn stage_file(dir: &Path, path: &Path) -> Result<()> {
     let repo = open(dir)?;
     let mut index = repo.index()?;
@@ -309,13 +273,11 @@ pub fn stage_file(dir: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `git restore --staged <path>`.
 pub fn unstage_file(dir: &Path, path: &Path) -> Result<()> {
     let repo = open(dir)?;
     unstage_paths(&repo, &[path.to_path_buf()])
 }
 
-/// `git add -A`.
 pub fn stage_all(dir: &Path) -> Result<()> {
     let repo = open(dir)?;
     let mut index = repo.index()?;
@@ -325,15 +287,12 @@ pub fn stage_all(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `git restore --staged :/`.
 pub fn unstage_all(dir: &Path) -> Result<()> {
     let repo = open(dir)?;
     let mut options = StatusOptions::new();
     options.show(StatusShow::Index).renames_head_to_index(true);
     let mut paths = Vec::new();
     for entry in repo.statuses(Some(&mut options))?.iter() {
-        // For renames both sides must be reset: the new path leaves the index
-        // and the old one comes back.
         if let Some(delta) = entry.head_to_index() {
             paths.extend(delta.old_file().path().map(Path::to_path_buf));
             paths.extend(delta.new_file().path().map(Path::to_path_buf));
@@ -348,8 +307,6 @@ pub fn unstage_all(dir: &Path) -> Result<()> {
 }
 
 fn unstage_paths(repo: &Repository, paths: &[PathBuf]) -> Result<()> {
-    // With no HEAD (first commit) there is nothing to reset to: `None` removes
-    // the entries from the index, which is what unstaging means there.
     let head = match repo.head() {
         Ok(head) => Some(head.peel_to_commit()?.into_object()),
         Err(err) if err.code() == ErrorCode::UnbornBranch => None,
@@ -359,10 +316,6 @@ fn unstage_paths(repo: &Repository, paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-// ---- Commit -----------------------------------------------------------------
-
-/// Commits the index. When nothing is staged and `all_if_empty` is set, stages
-/// everything first (the old "Commit All" behaviour). Returns the short hash.
 pub fn commit(dir: &Path, message: &str, all_if_empty: bool) -> Result<String> {
     let repo = open(dir)?;
     let message = git2::message_prettify(message, Some(b'#')).context("invalid commit message")?;
@@ -377,8 +330,6 @@ pub fn commit(dir: &Path, message: &str, all_if_empty: bool) -> Result<String> {
         bail!("Nothing staged to commit");
     }
 
-    // Hooks, signing and merge/cherry-pick commits are git's job; libgit2
-    // would silently skip them.
     if needs_cli_commit(&repo) {
         let workdir = workdir(&repo)?;
         if !staged_any {
@@ -437,10 +388,6 @@ fn needs_cli_commit(repo: &Repository) -> bool {
     COMMIT_HOOKS.iter().any(|hook| hooks.join(hook).is_file())
 }
 
-// ---- Discard ----------------------------------------------------------------
-
-/// Throws away the work tree change of `change`: untracked files are deleted,
-/// tracked ones are restored from the index (conflicts from HEAD).
 pub fn discard(dir: &Path, change: &Change) -> Result<()> {
     let repo = open(dir)?;
     let absolute = workdir(&repo)?.join(&change.path);
@@ -465,10 +412,6 @@ pub fn discard(dir: &Path, change: &Change) -> Result<()> {
     }
 }
 
-// ---- Network (git CLI) ------------------------------------------------------
-
-/// Runs the git CLI. Used only where libgit2 would lack the user's
-/// credentials/ssh-agent setup (network) or skip behaviour (hooks, signing).
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
@@ -495,15 +438,12 @@ pub fn fetch(dir: &Path) -> Result<String> {
     git(dir, &["fetch", "--prune"])
 }
 
-/// Clones `url` into `parent/<repo name>` and returns the new checkout path.
 pub fn clone(url: &str, parent: &Path) -> Result<PathBuf> {
     let name = repo_name(url).context("could not derive a folder name from the URL")?;
     let target = parent.join(&name);
     if target.exists() {
         bail!("{} already exists", target.display());
     }
-    // `--` keeps the URL and folder from being read as options
-    // (`--upload-pack=<cmd>` would run a command).
     git(parent, &["clone", "--", url.trim(), &name])?;
     Ok(target)
 }
@@ -515,7 +455,6 @@ pub fn repo_name(url: &str) -> Option<String> {
     }
     let trimmed = trimmed.trim_end_matches('/').trim_end_matches(".git");
     let name = trimmed.rsplit(['/', ':']).next()?;
-    // The name becomes a folder next to others: no `.`/`..`, no option.
     (!name.is_empty() && name != "." && name != ".." && !name.starts_with('-')).then(|| name.to_string())
 }
 
@@ -575,7 +514,6 @@ mod tests {
         assert_eq!(relative_time(86_400 * 365 * 2, 0), "2 years ago");
     }
 
-    /// A throwaway repo under the system temp dir, removed on drop.
     struct TempRepo {
         dir: PathBuf,
         repo: Repository,
@@ -589,7 +527,6 @@ mod tests {
             let mut config = repo.config().unwrap();
             config.set_str("user.name", "Forge Test").unwrap();
             config.set_str("user.email", "forge@example.com").unwrap();
-            // Keep a global hooksPath/gpgsign from routing commits to the CLI.
             config.set_str("core.hooksPath", ".git/no-hooks").unwrap();
             config.set_bool("commit.gpgsign", false).unwrap();
             drop(config);
@@ -633,13 +570,11 @@ mod tests {
             vec![("a.txt".into(), FileStatus::Untracked), ("dir/b.txt".into(), FileStatus::Untracked)]
         );
 
-        // Stage and unstage a single file before the first commit (no HEAD).
         stage_file(&t.dir, Path::new("a.txt")).unwrap();
         assert_eq!(paths(&t.state().staged), vec![("a.txt".into(), FileStatus::Added)]);
         unstage_file(&t.dir, Path::new("a.txt")).unwrap();
         assert!(t.state().staged.is_empty());
 
-        // Nothing staged: refused unless commit-all is allowed.
         assert!(commit(&t.dir, "nothing", false).is_err());
         commit(&t.dir, "initial", true).unwrap();
         let state = t.state();
@@ -648,7 +583,6 @@ mod tests {
         assert_eq!(state.log[0].subject, "initial");
         assert_eq!(state.log[0].author, "Forge Test");
 
-        // Modify both, stage one: only that one is committed.
         t.write("a.txt", "one changed\n");
         t.write("dir/b.txt", "two changed\n");
         stage_file(&t.dir, Path::new("a.txt")).unwrap();
@@ -665,7 +599,6 @@ mod tests {
         assert_eq!(state.log[0].subject, "change a");
         assert_eq!(state.log.len(), 2);
 
-        // A file both staged and further modified shows up in both lists.
         stage_file(&t.dir, Path::new("dir/b.txt")).unwrap();
         t.write("dir/b.txt", "two changed again\n");
         let state = t.state();
@@ -704,7 +637,6 @@ mod tests {
         assert!(state.staged.is_empty());
         assert_eq!(state.unstaged.len(), 3);
 
-        // Discard restores tracked files and deletes untracked ones.
         for change in &state.unstaged {
             discard(&t.dir, change).unwrap();
         }

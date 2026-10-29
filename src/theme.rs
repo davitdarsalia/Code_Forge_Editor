@@ -1,6 +1,3 @@
-//! Xcode-like dark palette. Chrome colors live here; the component theme is
-//! tuned to match so editor, inputs and buttons blend in.
-
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Hsla, px, rgb};
 
@@ -28,11 +25,8 @@ impl Palette {
     pub fn faint() -> Hsla { c(0x5c5c61) }
     pub fn accent() -> Hsla { c(0x0a84ff) }
     pub fn accent_hover() -> Hsla { c(0x2a95ff) }
-    /// Selected segment of a chip/tab group (⌘P modes, search options).
     pub fn chip_active() -> Hsla { ca(0x0a84ff, 0.3) }
-    /// Background behind matched text in search results.
     pub fn match_bg() -> Hsla { ca(0xd9a54a, 0.45) }
-    /// Tint of the window while files are dragged over it.
     pub fn drop_target() -> Hsla { ca(0x0a84ff, 0.08) }
     pub fn row_selected() -> Hsla { ca(0x0a84ff, 0.32) }
     pub fn row_hover() -> Hsla { ca(0xffffff, 0.05) }

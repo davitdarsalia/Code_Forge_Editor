@@ -1,19 +1,3 @@
-//! On-disk copy of a project's file index, so the next launch has ⌘P and
-//! project search before the tree walk finishes.
-//!
-//! Strategy is "stale-while-revalidate": the cached list is used right away,
-//! a fresh walk runs in the background anyway, and the cache is rewritten
-//! only when the fresh list differs.
-//!
-//! Format is plain text so it is easy to inspect:
-//!
-//! ```text
-//! forge-index 1
-//! /absolute/path/to/project
-//! relative/file/one.rs
-//! relative/file/two.swift
-//! ```
-
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -21,8 +5,6 @@ use crate::search::FileIndex;
 
 const HEADER: &str = "forge-index 1";
 
-/// `~/Library/Caches/Forge/index/<name>-<hash>.txt`. The hash keeps two
-/// projects with the same folder name apart.
 pub fn cache_path(root: &Path) -> Option<PathBuf> {
     let mut hasher = DefaultHasher::new();
     root.hash(&mut hasher);
@@ -68,7 +50,6 @@ fn save_to(path: &Path, index: &FileIndex) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Files added and removed between two sorted lists.
 pub fn diff(old: &[String], new: &[String]) -> (usize, usize) {
     let (mut added, mut removed) = (0, 0);
     let (mut i, mut j) = (0, 0);

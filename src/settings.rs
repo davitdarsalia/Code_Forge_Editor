@@ -1,6 +1,3 @@
-//! User settings, persisted as JSON next to `recent.json`, plus the small
-//! window that edits them (Forge ▸ Settings…, ⌘,).
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,8 +15,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme::{Palette, ca};
 
-/// Everything the user can tune. Unknown or missing fields fall back to the
-/// defaults so old files keep loading after new settings are added.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -30,7 +25,6 @@ pub struct Settings {
     pub show_inspector: bool,
     pub open_last_project: bool,
     pub launch_full_screen: bool,
-    /// Every icon in the app, 1.0 = 100%.
     pub icon_scale: f32,
 }
 
@@ -63,7 +57,6 @@ impl Settings {
         Duration::from_millis(self.autosave_delay_ms)
     }
 
-    /// Keeps hand-edited files from producing unusable values.
     pub fn sanitized(mut self) -> Self {
         let defaults = Settings::default();
         self.autosave_delay_ms = self.autosave_delay_ms.clamp(AUTOSAVE_RANGE.0, AUTOSAVE_RANGE.1);
@@ -78,7 +71,6 @@ impl Settings {
         self
     }
 
-    /// Mirrors settings that render code reads without the global.
     pub fn apply_statics(&self) {
         crate::icons::set_scale(self.icon_scale);
     }
@@ -126,13 +118,9 @@ fn save_to(path: &Path, settings: &Settings) -> std::io::Result<()> {
     crate::files::write_atomic(path, &bytes)
 }
 
-/// Generation of the newest settings handed to a background save.
 static SAVE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Generation last written; the lock also keeps two writes from interleaving.
 static SAVED_GENERATION: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
 
-/// Saves on a pool thread can run in any order (typing "500" in the autosave
-/// field queues three); an older snapshot must never land after a newer one.
 fn save_generation(path: &Path, settings: &Settings, generation: u64) -> std::io::Result<()> {
     let mut saved = SAVED_GENERATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if generation <= *saved {
@@ -143,8 +131,6 @@ fn save_generation(path: &Path, settings: &Settings, generation: u64) -> std::io
     Ok(())
 }
 
-/// Replaces the global settings, persists them and redraws every window so
-/// live settings (fonts, wrap) apply at once.
 pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
     let mut settings = Settings::get(cx).clone();
     change(&mut settings);
@@ -166,8 +152,6 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
     cx.set_global(settings);
     cx.refresh_windows();
 }
-
-// ---- Settings window -------------------------------------------------------
 
 pub struct SettingsView {
     autosave: Entity<InputState>,
@@ -196,9 +180,7 @@ impl SettingsView {
                 .default_value(current.icon_scale * 100.)
         });
 
-        // Values apply as soon as they parse; out-of-range input is clamped on save.
         let subscriptions = vec![
-            // Live while dragging: every icon in every window resizes with it.
             cx.subscribe(&icon_size, |_, _, event: &SliderEvent, cx| {
                 let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
                 let percent = value.start();
@@ -234,8 +216,6 @@ fn format_size(size: f32) -> String {
     if size.fract() == 0. { format!("{size:.0}") } else { format!("{size}") }
 }
 
-/// Font sizes must be in range to apply live: typing "1" on the way to "14"
-/// must not shrink everything for a moment.
 fn parse_size(text: &str) -> Option<f32> {
     text.trim().parse::<f32>().ok().filter(|s| (FONT_RANGE.0..=FONT_RANGE.1).contains(s))
 }
@@ -260,8 +240,6 @@ fn number_field(input: &Entity<InputState>, unit: &'static str) -> impl IntoElem
         .child(div().w(px(20.)).text_size(px(11.)).text_color(Palette::faint()).child(unit))
 }
 
-/// Sample of what the icon size affects: file and folder icons, UI glyphs
-/// and a file-tree row, drawn at the current scale.
 fn icon_preview() -> impl IntoElement {
     const FILES: &[&str] = &["App.swift", "MainActivity.kt", "build.gradle.kts", "AndroidManifest.xml", "Gemfile", "package.json", "main.rs"];
     let tree_row = |name: &'static str, folder: bool, depth: f32| {

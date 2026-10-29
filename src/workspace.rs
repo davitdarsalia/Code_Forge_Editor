@@ -1,6 +1,3 @@
-//! The single window: toolbar, navigator (left), editor tabs (center),
-//! inspector (right), terminal (bottom) and status bar.
-
 use std::cell::Cell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -40,38 +37,29 @@ use gpui_kit::Focusable as _;
 use crate::theme::{Palette, ca};
 
 const GIT_REFRESH_DELAY: Duration = Duration::from_millis(600);
-/// Window activation re-reads tree, git status and the file index; skipped
-/// when the last full sync is younger than this (e.g. the activation that
-/// follows launch, or quick ⌘-Tab round trips).
 const ACTIVATION_RESYNC_MIN: Duration = Duration::from_secs(2);
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const TOOLBAR_HEIGHT: f32 = 38.;
 const STATUS_HEIGHT: f32 = 22.;
-/// Progress-bar repaint rate while indexing; nothing ticks when idle.
 const INDEX_TICK: Duration = Duration::from_millis(80);
-/// Short walks finish before this and never flash a progress bar.
 const INDEX_BAR_DELAY: Duration = Duration::from_millis(120);
 const MAX_LOG_LINES: usize = 200;
-/// Places Go Back (⌃⌘←) can return to.
 const MAX_HISTORY: usize = 100;
 
 struct Indexing {
     progress: Arc<IndexProgress>,
     started: Instant,
-    /// File count from the cache or the previous walk, for a real percentage.
     expected: Option<usize>,
     _ticker: Task<()>,
 }
 
 struct LogLine {
-    /// Time since the project was opened.
     at: Duration,
     text: SharedString,
 }
 
 const ROW_HEIGHT: f32 = 22.;
 const HANDLE_WIDTH: f32 = 6.;
-/// Feel of the sidebar slide: ~0.4 s period, slightly under-damped.
 const PANEL_SPRING: Spring = Spring::new(Duration::from_millis(420)).with_damping(0.82);
 
 #[derive(Clone, Copy, PartialEq)]
@@ -89,15 +77,12 @@ struct Document {
     saved_hash: u64,
     dirty: bool,
     mtime: Option<SystemTime>,
-    /// Autosave found the file changed on disk and left it alone; reported once.
     conflict: bool,
     save_task: Option<Task<()>>,
-    /// Go to Definition for languages with a server (see `lsp.rs`).
     definitions: Option<Rc<lsp::Definitions>>,
     _subscription: Subscription,
 }
 
-/// A cursor place for Go Back / Go Forward.
 #[derive(Clone, PartialEq)]
 struct NavPoint {
     path: PathBuf,
@@ -111,7 +96,6 @@ enum Navigator {
     Changes,
 }
 
-/// Which tab the bottom panel shows.
 #[derive(Clone, Copy, PartialEq)]
 enum BottomTab {
     Terminal,
@@ -143,14 +127,10 @@ pub struct Workspace {
     show_preview: bool,
     preview_task: Option<Task<()>>,
     repo: Option<RepoState>,
-    /// File tree git decorations, rebuilt off the UI thread per status read;
-    /// shared (not cloned) into the tree's row renderer.
     git_marks: Rc<TreeMarks>,
-    /// When tree/git/index were last re-read (see `ACTIVATION_RESYNC_MIN`).
     last_sync: Option<Instant>,
     git_busy: bool,
     git_task: Option<Task<()>>,
-    /// Selected row in the Changes navigator: (staged section, repo-relative path).
     selected_change: Option<(bool, PathBuf)>,
     commit_input: Entity<InputState>,
     clone_input: Entity<InputState>,
@@ -162,9 +142,7 @@ pub struct Workspace {
     index: Option<Arc<FileIndex>>,
     index_task: Option<Task<()>>,
     cache_task: Option<Task<()>>,
-    /// Set while a walk runs; drives the status-bar progress bar.
     indexing: Option<Indexing>,
-    /// Whether the on-disk cache matches `index`.
     cache_in_sync: bool,
     index_log: Vec<LogLine>,
     index_log_open: bool,
@@ -179,7 +157,6 @@ pub struct Workspace {
     drag: Option<Drag>,
     focus: FocusHandle,
     tree_scroll: UniformListScrollHandle,
-    /// Soft-wrap value last pushed to the open editors (see `sync_settings`).
     soft_wrap: bool,
     lsp: Rc<lsp::Manager>,
     definition_task: Option<Task<()>>,
@@ -200,15 +177,11 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 #[derive(Debug, PartialEq)]
 enum ExternalChange {
-    /// On disk as we last loaded or saved it (or gone: saving recreates it).
     None,
-    /// Touched but same content: adopt the new mtime.
     Touched(Option<SystemTime>),
-    /// Someone else rewrote it since we loaded or saved it.
     Changed,
 }
 
-/// Compares the file on disk with the version a document last loaded/saved.
 fn external_change(path: &Path, known_mtime: Option<SystemTime>, saved_hash: u64) -> ExternalChange {
     let current = mtime(path);
     if current.is_none() || current == known_mtime {
@@ -217,7 +190,6 @@ fn external_change(path: &Path, known_mtime: Option<SystemTime>, saved_hash: u64
     match std::fs::read_to_string(path) {
         Ok(text) if hash_text(&text) == saved_hash => ExternalChange::Touched(current),
         Ok(_) => ExternalChange::Changed,
-        // Unreadable now: let the write report the real error.
         Err(_) => ExternalChange::None,
     }
 }
@@ -261,7 +233,6 @@ impl Workspace {
                 QuickOpenEvent::Open(path) => this.open_file(&path.clone(), window, cx),
                 QuickOpenEvent::OpenAt { path, line, column } => this.open_at(&path.clone(), *line, *column, window, cx),
                 QuickOpenEvent::Run(action) => {
-                    // Give focus back first so the action dispatches from the window, not the closed overlay.
                     this.focus_active_editor(window, cx);
                     window.dispatch_action(action.boxed_clone(), cx);
                 }
@@ -269,13 +240,11 @@ impl Workspace {
             }
             cx.notify();
         }));
-        // Pick up edits made outside the editor (git checkout, other tools).
         subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
             if crate::startup::enabled() {
                 crate::startup::mark(&format!("window active={}", window.is_window_active()));
             }
             if window.is_window_active() {
-                // Cheap (one stat per open file): always.
                 this.reload_changed_documents(window, cx);
                 if this.last_sync.is_some_and(|at| at.elapsed() < ACTIVATION_RESYNC_MIN) {
                     return;
@@ -288,8 +257,6 @@ impl Workspace {
                 this.save_all(false, cx);
             }
         }));
-        // Closing the window or quitting (also via the Dock or a logout, which
-        // bypass the Quit action) keeps what the user typed.
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
             if let Some(workspace) = weak.upgrade() {
@@ -361,9 +328,6 @@ impl Workspace {
         }
     }
 
-    // ---- Opening ---------------------------------------------------------
-
-    /// Opens whatever the user dropped, picked or passed on the command line.
     pub fn open_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
         for path in paths {
             let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
@@ -386,7 +350,6 @@ impl Workspace {
         if self.root.as_ref() == Some(&root) {
             return;
         }
-        // The open documents are dropped below: never lose unsaved edits.
         if !self.save_all(false, cx) {
             self.notify_error("Some files could not be saved; save (⌘S) or close them before switching projects", cx);
             return;
@@ -407,11 +370,8 @@ impl Workspace {
         crate::startup::mark("open_project: tree root loaded");
         self.root = Some(root.clone());
         self.recent = recent::push(&root);
-        // Refreshes Open Recent; off the first frame's critical path.
         cx.on_next_frame(window, |_, _, cx| crate::set_menus(cx));
         crate::startup::mark("open_project: recent + menus");
-        // The login shell is not needed for the first frame: spawn it right
-        // after, so opening a project paints without waiting on fork/exec.
         cx.on_next_frame(window, |this, window, cx| {
             if this.show_terminal && this.root.is_some() {
                 this.ensure_terminal(window, cx);
@@ -432,15 +392,10 @@ impl Workspace {
         cx.notify();
     }
 
-    // ---- Index, quick open, search --------------------------------------
-
-    /// Re-walks the project on every core in the background.
     fn reindex(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
-        // 1. Nothing loaded yet: read last session's list first. It takes a
-        //    few ms and makes ⌘P and search usable before the walk ends.
         if self.index.is_none() {
             let cache_root = root.clone();
             let project = root.clone();
@@ -455,7 +410,6 @@ impl Workspace {
                         return;
                     }
                     match cached {
-                        // The walk may already have won the race; keep its result.
                         Some(index) if this.index.is_none() => {
                             this.log(format!("Loaded {} files from cache in {} ms", index.files.len(), took.as_millis()));
                             if let Some(indexing) = this.indexing.as_mut() {
@@ -472,10 +426,8 @@ impl Workspace {
             }));
         }
 
-        // 2. Walk the tree on every core and publish progress while it runs.
         let progress = Arc::new(IndexProgress::default());
         self.log(format!("Scanning {name}…"));
-        // Repaint the progress bar while the walk runs; stops on its own.
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(INDEX_TICK).await;
@@ -505,7 +457,6 @@ impl Workspace {
             let (index, took) = task.await;
             let index = Arc::new(index);
             let _ = this.update(cx, |this, cx| {
-                // A project switch while indexing makes this result stale.
                 if this.root.as_ref() != Some(&index.root) {
                     return;
                 }
@@ -519,7 +470,6 @@ impl Workspace {
                     index.files.len(),
                     took.as_millis()
                 ));
-                // 3. Persist only when the list actually changed.
                 if added + removed > 0 || !this.cache_in_sync {
                     this.cache_in_sync = true;
                     let to_save = index.clone();
@@ -599,8 +549,6 @@ impl Workspace {
         });
     }
 
-    /// Where focus goes back to after an overlay, dialog or panel closes:
-    /// the active editor, else the workspace itself so shortcuts keep working.
     fn focus_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.active.and_then(|ix| self.docs.get(ix)) {
             Some(doc) => doc.editor.update(cx, |state, cx| state.focus(window, cx)),
@@ -629,7 +577,6 @@ impl Workspace {
             self.notify_error(format!("{} looks like a binary file", path.display()), cx);
             return;
         }
-        // Lossy decoding would rewrite every non-UTF-8 byte on the next autosave.
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
             Err(_) => {
@@ -697,11 +644,6 @@ impl Workspace {
         self.activate(ix, window, cx);
     }
 
-    // ---- Go to Definition, Go Back / Forward ------------------------------
-
-    /// Where the editor sends ⌘-click and its context menu's Go to Definition.
-    /// Deferred: the editor that asks is mid-update, and the target may be
-    /// that same editor.
     fn show_document_handler(&self, cx: &mut Context<Self>) -> ShowDocumentHandler {
         let workspace = cx.weak_entity();
         Rc::new(move |params, window, cx| {
@@ -730,7 +672,6 @@ impl Workspace {
         }
     }
 
-    /// Opens a server-reported location (`lsp_start` in UTF-16 columns).
     fn jump_to(&mut self, path: &Path, lsp_start: Position, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.nav_point(cx);
         if !self.open_navigated(path, window, cx) {
@@ -753,8 +694,6 @@ impl Workspace {
         }
     }
 
-    /// Opens `path` for navigation; files outside the project (std sources,
-    /// generated interfaces) open read-only so autosave never touches them.
     fn open_navigated(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.open_file(path, window, cx);
         let Some(doc) = self.active_doc().filter(|doc| doc.path == path) else { return false };
@@ -764,7 +703,6 @@ impl Workspace {
         true
     }
 
-    /// ⌃⌘J: the definition of the symbol at the cursor.
     pub fn go_to_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = self.active_doc() else { return };
         let Some(definitions) = doc.definitions.clone() else {
@@ -800,7 +738,6 @@ impl Workspace {
         }));
     }
 
-    /// ⌃⌘← / ⌃⌘→: back and forth along definition jumps.
     pub fn step_history(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
         let target = if back { self.back.pop() } else { self.forward.pop() };
         let Some(target) = target else { return };
@@ -827,7 +764,6 @@ impl Workspace {
         let Some(ix) = self.active else { return };
         let id = self.docs[ix].id;
         if !self.save_doc(id, false, cx) {
-            // Unsaved edits would be lost: only close when the user says so.
             let name = self.docs[ix].path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let answer = window.prompt(
                 PromptLevel::Warning,
@@ -866,13 +802,10 @@ impl Workspace {
         self.close_active(window, cx);
     }
 
-    // ---- Autosave --------------------------------------------------------
-
     fn schedule_save(&mut self, id: usize, cx: &mut Context<Self>) {
         let delay = Settings::get(cx).autosave_delay();
         let Some(doc) = self.docs.iter_mut().find(|d| d.id == id) else { return };
         doc.dirty = true;
-        // Replacing the task drops (cancels) the previous timer: a debounce.
         doc.save_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |this, cx| this.save_doc(id, false, cx));
@@ -880,11 +813,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Writes the buffer if it differs from what was last saved. Returns
-    /// whether the buffer is now safely on disk. Without `force` a file that
-    /// changed on disk since it was loaded is left alone (an autosave must not
-    /// clobber a `git checkout` run in the terminal); ⌘S, closing the window
-    /// and quitting pass `force` and overwrite it.
     fn save_doc(&mut self, id: usize, force: bool, cx: &mut Context<Self>) -> bool {
         let Some(ix) = self.docs.iter().position(|d| d.id == id) else { return true };
         let text = self.docs[ix].editor.read(cx).value();
@@ -935,7 +863,6 @@ impl Workspace {
         saved
     }
 
-    /// Saves every document; `false` if any could not be saved.
     pub fn save_all(&mut self, force: bool, cx: &mut Context<Self>) -> bool {
         let ids: Vec<usize> = self.docs.iter().map(|d| d.id).collect();
         let mut all = true;
@@ -964,17 +891,12 @@ impl Workspace {
         cx.notify();
     }
 
-    // ---- Format (⌘I) ------------------------------------------------------
-
-    /// Formats the active file off the UI thread and applies the result if
-    /// the buffer did not change meanwhile.
     pub fn format_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = self.active_doc() else { return };
         let (id, path) = (doc.id, doc.path.clone());
         let text = doc.editor.read(cx).value().to_string();
         let language = files::language_for(&path);
         let before = hash_text(&text);
-        // Replacing the task cancels a format still in flight.
         self.format_task = Some(cx.spawn_in(window, async move |this, cx| {
             let outcome = cx
                 .background_spawn(async move { crate::format::format(&path, language, &text) })
@@ -1014,11 +936,9 @@ impl Workspace {
         }
         editor.update(cx, |state, cx| {
             let cursor = state.cursor_position();
-            // replace_all keeps undo history, so ⌘Z reverts the format.
             state.replace_all(text.clone(), window, cx);
             let last_line = text.split('\n').count().saturating_sub(1) as u32;
             let line = cursor.line.min(last_line);
-            // The column is clamped to the line length by the editor.
             state.set_cursor_position(Position { line, character: cursor.character }, window, cx);
         });
         self.schedule_save(id, cx);
@@ -1027,13 +947,10 @@ impl Workspace {
         }
     }
 
-    // ---- Preview canvas --------------------------------------------------
-
     fn active_doc(&self) -> Option<&Document> {
         self.active.and_then(|ix| self.docs.get(ix))
     }
 
-    /// Whether the active file gets a canvas next to the editor.
     fn preview_open(&self) -> bool {
         self.show_preview && self.active_doc().is_some_and(|doc| preview::supports(&doc.path))
     }
@@ -1042,7 +959,6 @@ impl Workspace {
         if !self.preview_open() || self.active_doc().map(|d| d.id) != Some(id) {
             return;
         }
-        // Replacing the task drops (cancels) the previous timer: a debounce.
         self.preview_task = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(preview::UPDATE_DELAY).await;
             let _ = this.update_in(cx, |this, window, cx| this.refresh_preview(window, cx));
@@ -1065,8 +981,6 @@ impl Workspace {
         self.refresh_preview(window, cx);
         cx.notify();
     }
-
-    // ---- File tree -------------------------------------------------------
 
     fn rebuild_rows(&mut self) {
         self.rows = Rc::new(self.tree.as_ref().map(Node::rows).unwrap_or_default());
@@ -1091,8 +1005,6 @@ impl Workspace {
             self.open_file(&row.path.clone(), window, cx);
         }
     }
-
-    // ---- Git -------------------------------------------------------------
 
     fn schedule_git_refresh(&mut self, cx: &mut Context<Self>) {
         if self.git_busy {
@@ -1156,7 +1068,6 @@ impl Workspace {
         .detach();
     }
 
-    /// Pull / Push / Fetch from the Source Control menu and the Changes panel.
     pub fn run_remote(
         &mut self,
         label: &'static str,
@@ -1180,12 +1091,9 @@ impl Workspace {
             return;
         }
         self.commit_input.update(cx, |input, cx| input.set_value("", window, cx));
-        // Commits the staged files; with nothing staged it commits everything.
         self.run_git("Commit", move |root| git::commit(root, &message, true), window, cx);
     }
 
-    /// Discard cannot be undone (untracked files are deleted), so it always
-    /// asks first; the button sits right next to "stage".
     fn confirm_discard(&mut self, change: git::Change, window: &mut Window, cx: &mut Context<Self>) {
         let name = change.path.display().to_string();
         let detail = if change.status == FileStatus::Untracked {
@@ -1214,8 +1122,6 @@ impl Workspace {
         .detach();
     }
 
-    /// Quick index edits (stage/unstage). Unlike `run_git` these don't post a
-    /// "finished" notice; the refreshed lists are the feedback.
     fn run_index_op(
         &mut self,
         op: impl FnOnce(&Path) -> anyhow::Result<()> + Send + 'static,
@@ -1225,7 +1131,6 @@ impl Workspace {
         if self.git_busy {
             return;
         }
-        // Stage what the editor shows, not a stale on-disk version.
         self.save_all(false, cx);
         let task = cx.background_spawn(async move { op(&root) });
         cx.spawn(async move |this, cx| {
@@ -1240,15 +1145,12 @@ impl Workspace {
         .detach();
     }
 
-    // ---- Clone -----------------------------------------------------------
-
     pub fn show_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clone_open = true;
         self.clone_input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
 
-    /// Cancel / Escape / click-away. A running clone keeps the dialog open.
     fn close_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.clone_busy {
             return;
@@ -1298,8 +1200,6 @@ impl Workspace {
         .detach();
     }
 
-    // ---- Panels ----------------------------------------------------------
-
     pub fn toggle_left(&mut self, cx: &mut Context<Self>) {
         self.show_left = !self.show_left;
         cx.notify();
@@ -1314,7 +1214,6 @@ impl Workspace {
         self.show_terminal = !self.show_terminal;
         if self.show_terminal {
             self.ensure_terminal(window, cx);
-            // Only grab focus when the shell is the visible tab, not the build log.
             if self.bottom_tab == BottomTab::Terminal {
                 if let Some(terminal) = self.terminal.as_ref() {
                     let focus = terminal.read(cx).focus_handle(cx);
@@ -1322,7 +1221,6 @@ impl Workspace {
                 }
             }
         } else {
-            // Don't leave keystrokes going to a hidden shell.
             self.focus_active_editor(window, cx);
         }
         cx.notify();
@@ -1343,9 +1241,6 @@ impl Workspace {
         }
     }
 
-    // ---- Build -----------------------------------------------------------
-
-    /// ⇧⌘B / ⇧⌘K / Install: saves everything first, like Xcode.
     pub fn run_build(&mut self, action: BuildAction, cx: &mut Context<Self>) {
         if self.root.is_none() {
             return;
@@ -1358,9 +1253,6 @@ impl Workspace {
         self.build.update(cx, |build, cx| build.stop(cx));
     }
 
-    // ---- Shortcut targets ------------------------------------------------
-
-    /// Shows the terminal (starting it if needed) and moves focus into it.
     pub fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_terminal = true;
         self.bottom_tab = BottomTab::Terminal;
@@ -1372,7 +1264,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Restarts the shell in the project root, showing and focusing it.
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let existed = self.terminal.is_some();
         self.focus_terminal(window, cx);
@@ -1381,7 +1272,6 @@ impl Workspace {
         }
     }
 
-    /// Switches the navigator tab (⌘1/⌘2/⌘3), opening the navigator.
     pub fn show_navigator(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
         let nav = match tab {
             0 => Navigator::Files,
@@ -1397,7 +1287,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Expands the tree down to the active file and scrolls it into view.
     pub fn reveal_active(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.active.and_then(|ix| self.docs.get(ix)).map(|d| d.path.clone()) else { return };
         let Some(tree) = self.tree.as_mut() else { return };
@@ -1411,7 +1300,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Opens the Changes tab and puts the cursor in the commit message box.
     pub fn focus_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.root.is_none() {
             return;
@@ -1422,7 +1310,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Cycles editor tabs; `forward` = ⌘⇧], otherwise ⌘⇧[.
     pub fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.docs.len();
         let Some(ix) = self.active.filter(|_| count > 1) else { return };
@@ -1430,7 +1317,6 @@ impl Workspace {
         self.activate(next, window, cx);
     }
 
-    /// Pushes settings that live in editor state (not read at render time).
     fn sync_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let soft_wrap = Settings::get(cx).soft_wrap;
         if soft_wrap == self.soft_wrap {
@@ -1441,8 +1327,6 @@ impl Workspace {
             doc.editor.update(cx, |state, cx| state.set_soft_wrap(soft_wrap, window, cx));
         }
     }
-
-    // ---- Notices ---------------------------------------------------------
 
     fn notify_info(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.set_notice(Notice::Info(message.into()), cx);
@@ -1471,8 +1355,6 @@ fn git_root(path: &Path) -> Option<PathBuf> {
     path.ancestors().skip(1).find(|dir| dir.join(".git").exists()).map(Path::to_path_buf)
 }
 
-// ---- Rendering --------------------------------------------------------------
-
 fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
     crate::icons::ui_icon(name, size, color)
 }
@@ -1494,8 +1376,6 @@ fn tool_button(
         .hover(|s| s.bg(ca(0xffffff, 0.08)))
         .active(|s| s.bg(ca(0xffffff, 0.14)))
         .child(icon(name, 16., if active { Palette::accent() } else { Palette::muted() }))
-        // Two quick clicks on a button must not reach the toolbar's
-        // double-click handler, which zooms (resizes) the window.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click)
 }
@@ -1543,7 +1423,6 @@ fn section_header(title: impl Into<SharedString>) -> impl IntoElement {
         .child(title.into())
 }
 
-/// Section header with a right-aligned text action ("Stage All" / "Unstage All").
 fn change_section_header(
     id: &'static str,
     title: String,
@@ -1615,7 +1494,6 @@ impl Workspace {
             .bg(Palette::toolbar_bg())
             .border_b_1()
             .border_color(Palette::border())
-            // Room for the traffic lights.
             .pl(px(78.))
             .pr(px(8.))
             .gap(px(4.))
@@ -1655,15 +1533,12 @@ impl Workspace {
                     }),
             )
             .child(div().flex_1())
-            // Hidden until an Xcode or Gradle project is detected.
             .when(self.root.is_some() && self.build.read(cx).has_projects(), |el| {
                 el.child(build_panel::toolbar_segment(&self.build, cx))
             })
             .child(
-                // Xcode-style activity pill.
                 div()
                     .h(px(24.))
-                    // Shrinks before the build segment and toggles get pushed out.
                     .flex_shrink(1.)
                     .min_w(px(160.))
                     .max_w(px(520.))
@@ -1800,7 +1675,6 @@ impl Workspace {
             _ => Palette::text(),
         };
         let row_for_click = row.clone();
-        // The whole width of the sidebar is the hit target, not just the label.
         let inner = div()
             .size_full()
             .pl(px(indent))
@@ -1935,8 +1809,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// One file row. Staged rows offer "−" (unstage); unstaged rows offer
-    /// discard and "+" (stage). Buttons show on hover and on the selected row.
     fn render_change_row(&self, ix: usize, change: &git::Change, workdir: &Path, cx: &mut Context<Self>) -> AnyElement {
         let staged = change.staged;
         let selected = self
@@ -2136,9 +2008,6 @@ impl Workspace {
             .child(content)
     }
 
-    /// Pane the native web view is laid over. The web view draws above all
-    /// GPUI content, so it is hidden while overlays are open or the pane edge
-    /// is dragged (it would swallow the mouse).
     fn render_preview(&self, cx: &App) -> impl IntoElement {
         let live = !self.quick_open_visible
             && !self.clone_open
@@ -2314,8 +2183,6 @@ impl Workspace {
         panel
     }
 
-    /// Bar, count and folder while a walk runs; otherwise the file count.
-    /// Either one opens the indexing log.
     fn render_index_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.indexing.as_ref().filter(|i| i.started.elapsed() >= INDEX_BAR_DELAY);
         let content = match running {
@@ -2323,9 +2190,7 @@ impl Workspace {
                 let found = indexing.progress.files.load(std::sync::atomic::Ordering::Relaxed);
                 const BAR: f32 = 120.;
                 let (left, width) = match indexing.expected {
-                    // Known size: real fraction, held short of full until done.
                     Some(expected) if expected > 0 => (0., BAR * (found as f32 / expected as f32).min(0.97)),
-                    // First scan: a sliding chunk, since the total is unknown.
                     _ => {
                         let phase = (indexing.started.elapsed().as_millis() % 1200) as f32 / 1200.;
                         (BAR * 0.7 * phase, BAR * 0.3)
@@ -2598,7 +2463,6 @@ impl Workspace {
             .justify_center()
             .pt(px(120.))
             .on_click(cx.listener(|this, _, window, cx| this.close_clone(window, cx)))
-            // Capture phase: the URL field would otherwise consume Escape.
             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
                 this.close_clone(window, cx);
                 cx.stop_propagation();
@@ -2696,7 +2560,6 @@ fn shorten_home(path: &Path) -> String {
     }
 }
 
-/// Thin divider with a wider invisible grab area for resizing a panel.
 fn drag_handle(id: &'static str, drag: Drag, cx: &mut Context<Workspace>) -> impl IntoElement {
     let vertical = drag == Drag::Bottom;
     div()
@@ -2749,8 +2612,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Animated size of a collapsible panel. While the user drags its edge the
-    /// spring is bypassed so the panel tracks the pointer exactly.
     fn panel_size(&self, id: &'static str, open: bool, size: f32, drag: Drag, window: &mut Window, cx: &mut App) -> f32 {
         let target = if open { size } else { 0. };
         let policy = if self.drag == Some(drag) { Spring::new(Duration::ZERO) } else { PANEL_SPRING };
@@ -2780,8 +2641,6 @@ impl Render for Workspace {
             let left = self.panel_size("left-panel", self.show_left, self.left_width, Drag::Left, window, cx);
             let right = self.panel_size("right-panel", self.show_right, self.right_width, Drag::Right, window, cx);
             let bottom = self.panel_size("bottom-panel", self.show_terminal, self.terminal_height, Drag::Bottom, window, cx);
-            // Content keeps its full size and is clipped by the animating
-            // container, so it slides instead of re-flowing every frame.
             let slide = |size: f32, full: f32, horizontal: bool, content: AnyElement| {
                 div()
                     .flex_none()
@@ -2843,8 +2702,6 @@ impl Render for Workspace {
             .when(self.root.is_some(), |el| el.child(self.render_status_bar(cx)))
             .when(self.root.is_some() && self.index_log_open, |el| el.child(self.render_index_log(cx)))
             .when(self.build.read(cx).picker_open(), |el| {
-                // Click-away backdrop for the build target picker (the menu
-                // itself is deferred, so it paints above this).
                 let build = self.build.clone();
                 el.child(
                     div()
@@ -2892,15 +2749,12 @@ mod tests {
         let saved_hash = hash_text("one");
         assert_eq!(external_change(&path, loaded, saved_hash), ExternalChange::None);
 
-        // Same content, newer mtime (e.g. `touch`, a no-op checkout).
         let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
         assert!(matches!(external_change(&path, Some(old), saved_hash), ExternalChange::Touched(Some(_))));
 
-        // Rewritten by someone else: an autosave must not overwrite it.
         std::fs::write(&path, "two").unwrap();
         assert_eq!(external_change(&path, Some(old), saved_hash), ExternalChange::Changed);
 
-        // Deleted: saving simply recreates it.
         std::fs::remove_file(&path).unwrap();
         assert_eq!(external_change(&path, loaded, saved_hash), ExternalChange::None);
         std::fs::remove_dir_all(&dir).unwrap();
