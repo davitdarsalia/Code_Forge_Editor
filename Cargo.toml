@@ -43,6 +43,9 @@ gpui-kit = { version = "0.8.1", features = [
     "tree-sitter-zig",
 ] }
 anyhow = "1"
+# libgit2, vendored and without network features: status/index/commit run in-process.
+# Network ops stay on the git CLI (see git.rs).
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 portable-pty = "0.9"
 vt100 = "0.18"
 serde = { version = "1", features = ["derive"] }
