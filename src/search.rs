@@ -60,17 +60,42 @@ impl Drop for Collector {
     }
 }
 
+/// Live counters a running walk publishes for the status bar. Workers only
+/// touch atomics on the hot path; the folder name is updated now and then.
+#[derive(Default)]
+pub struct IndexProgress {
+    pub files: AtomicUsize,
+    pub current_dir: std::sync::Mutex<String>,
+}
+
+impl IndexProgress {
+    pub fn current_dir(&self) -> String {
+        self.current_dir.lock().map(|dir| dir.clone()).unwrap_or_default()
+    }
+}
+
 /// Walks `root` on all cores and returns every non-ignored file.
+#[cfg(test)]
 pub fn build_index(root: &Path) -> FileIndex {
+    build_index_with_progress(root, &IndexProgress::default())
+}
+
+pub fn build_index_with_progress(root: &Path, progress: &IndexProgress) -> FileIndex {
     let (tx, rx) = flume::unbounded::<Vec<String>>();
     walker(root).build_parallel().run(|| {
         let mut collector = Collector { local: Vec::with_capacity(256), tx: tx.clone() };
         let root = root.to_path_buf();
         Box::new(move |entry| {
             if let Ok(entry) = entry {
+                let Ok(relative) = entry.path().strip_prefix(&root) else { return WalkState::Continue };
                 if entry.file_type().is_some_and(|t| t.is_file()) {
-                    if let Ok(relative) = entry.path().strip_prefix(&root) {
-                        collector.local.push(relative.to_string_lossy().into_owned());
+                    collector.local.push(relative.to_string_lossy().into_owned());
+                    progress.files.fetch_add(1, Ordering::Relaxed);
+                } else if entry.depth() <= 3 {
+                    // Shallow folders only: enough for a readable log line,
+                    // cheap enough to never contend.
+                    if let Ok(mut dir) = progress.current_dir.try_lock() {
+                        *dir = relative.to_string_lossy().into_owned();
                     }
                 }
             }

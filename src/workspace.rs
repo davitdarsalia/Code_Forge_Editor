@@ -26,7 +26,8 @@ use crate::git::{self, FileStatus, RepoState, TreeMarks};
 use crate::preview::{self, Preview};
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::recent;
-use crate::search::FileIndex;
+use crate::index_cache;
+use crate::search::{FileIndex, IndexProgress};
 use crate::settings::Settings;
 use crate::search_panel::{SearchEvent, SearchPanel};
 use crate::terminal::Terminal;
@@ -41,6 +42,26 @@ const ACTIVATION_RESYNC_MIN: Duration = Duration::from_secs(2);
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const TOOLBAR_HEIGHT: f32 = 38.;
 const STATUS_HEIGHT: f32 = 22.;
+/// Progress-bar repaint rate while indexing; nothing ticks when idle.
+const INDEX_TICK: Duration = Duration::from_millis(80);
+/// Short walks finish before this and never flash a progress bar.
+const INDEX_BAR_DELAY: Duration = Duration::from_millis(120);
+const MAX_LOG_LINES: usize = 200;
+
+struct Indexing {
+    progress: Arc<IndexProgress>,
+    started: Instant,
+    /// File count from the cache or the previous walk, for a real percentage.
+    expected: Option<usize>,
+    _ticker: Task<()>,
+}
+
+struct LogLine {
+    /// Time since the project was opened.
+    at: Duration,
+    text: SharedString,
+}
+
 const ROW_HEIGHT: f32 = 22.;
 const HANDLE_WIDTH: f32 = 6.;
 /// Feel of the sidebar slide: ~0.4 s period, slightly under-damped.
@@ -124,6 +145,14 @@ pub struct Workspace {
     format_task: Option<Task<()>>,
     index: Option<Arc<FileIndex>>,
     index_task: Option<Task<()>>,
+    cache_task: Option<Task<()>>,
+    /// Set while a walk runs; drives the status-bar progress bar.
+    indexing: Option<Indexing>,
+    /// Whether the on-disk cache matches `index`.
+    cache_in_sync: bool,
+    index_log: Vec<LogLine>,
+    index_log_open: bool,
+    log_epoch: Instant,
     search: Entity<SearchPanel>,
     quick_open: Entity<QuickOpen>,
     quick_open_visible: bool,
@@ -287,6 +316,12 @@ impl Workspace {
             format_task: None,
             index: None,
             index_task: None,
+            cache_task: None,
+            indexing: None,
+            cache_in_sync: false,
+            index_log: Vec::new(),
+            index_log_open: false,
+            log_epoch: Instant::now(),
             search,
             quick_open,
             quick_open_visible: false,
@@ -361,6 +396,9 @@ impl Workspace {
         self.refresh_git(cx);
         self.build.update(cx, |build, cx| build.set_root(root.clone(), cx));
         self.index = None;
+        self.cache_in_sync = false;
+        self.index_log.clear();
+        self.log_epoch = Instant::now();
         self.search.update(cx, |search, cx| search.set_index(None, cx));
         self.reindex(cx);
         crate::startup::mark("open_project: done (git/build/index queued)");
@@ -372,32 +410,134 @@ impl Workspace {
     /// Re-walks the project on every core in the background.
     fn reindex(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
-        let started = std::time::Instant::now();
+        let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+
+        // 1. Nothing loaded yet: read last session's list first. It takes a
+        //    few ms and makes ⌘P and search usable before the walk ends.
+        if self.index.is_none() {
+            let cache_root = root.clone();
+            let project = root.clone();
+            let load = cx.background_spawn(async move {
+                let started = Instant::now();
+                (index_cache::load(&cache_root), started.elapsed())
+            });
+            self.cache_task = Some(cx.spawn(async move |this, cx| {
+                let (cached, took) = load.await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.root.as_ref() != Some(&project) {
+                        return;
+                    }
+                    match cached {
+                        // The walk may already have won the race; keep its result.
+                        Some(index) if this.index.is_none() => {
+                            this.log(format!("Loaded {} files from cache in {} ms", index.files.len(), took.as_millis()));
+                            if let Some(indexing) = this.indexing.as_mut() {
+                                indexing.expected = Some(index.files.len());
+                            }
+                            this.cache_in_sync = true;
+                            this.apply_index(Arc::new(index), cx);
+                        }
+                        Some(_) => {}
+                        None => this.log("No cache yet, first full scan of this project"),
+                    }
+                    cx.notify();
+                });
+            }));
+        }
+
+        // 2. Walk the tree on every core and publish progress while it runs.
+        let progress = Arc::new(IndexProgress::default());
+        self.log(format!("Scanning {name}…"));
+        // Repaint the progress bar while the walk runs; stops on its own.
+        let ticker = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(INDEX_TICK).await;
+                let running = this.update(cx, |this, cx| {
+                    cx.notify();
+                    this.indexing.is_some()
+                });
+                if !matches!(running, Ok(true)) {
+                    break;
+                }
+            }
+        });
+        self.indexing = Some(Indexing {
+            progress: progress.clone(),
+            started: Instant::now(),
+            expected: self.index.as_ref().map(|i| i.files.len()),
+            _ticker: ticker,
+        });
+        let walk_root = root.clone();
         let task = cx.background_spawn(async move {
-            let index = crate::search::build_index(&root);
+            let started = Instant::now();
+            let index = crate::search::build_index_with_progress(&walk_root, &progress);
             crate::startup::mark("bg: index walk done");
-            index
+            (index, started.elapsed())
         });
         self.index_task = Some(cx.spawn(async move |this, cx| {
-            let index = Arc::new(task.await);
+            let (index, took) = task.await;
+            let index = Arc::new(index);
             let _ = this.update(cx, |this, cx| {
                 // A project switch while indexing makes this result stale.
                 if this.root.as_ref() != Some(&index.root) {
                     return;
                 }
-                let first = this.index.is_none();
-                if first {
-                    if crate::startup::enabled() {
-                        crate::startup::mark(&format!("index ready ({} files)", index.files.len()));
-                    }
-                    let message = format!("Indexed {} files in {} ms", index.files.len(), started.elapsed().as_millis());
-                    this.notify_info(message, cx);
+                this.indexing = None;
+                let (added, removed) = match this.index.as_ref() {
+                    Some(old) => index_cache::diff(&old.files, &index.files),
+                    None => (index.files.len(), 0),
+                };
+                this.log(format!(
+                    "Indexed {} files in {} ms (+{added} −{removed})",
+                    index.files.len(),
+                    took.as_millis()
+                ));
+                // 3. Persist only when the list actually changed.
+                if added + removed > 0 || !this.cache_in_sync {
+                    this.cache_in_sync = true;
+                    let to_save = index.clone();
+                    let save = cx.background_spawn(async move { index_cache::save(&to_save) });
+                    cx.spawn(async move |this, cx| {
+                        let result = save.await;
+                        let _ = this.update(cx, |this, cx| {
+                            match result {
+                                Ok(path) => this.log(format!("Cache saved → {}", shorten_home(&path))),
+                                Err(err) => {
+                                    this.cache_in_sync = false;
+                                    this.log(format!("Cache save failed: {err}"));
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                } else {
+                    this.log("Cache already up to date");
                 }
-                this.search.update(cx, |search, cx| search.set_index(Some(index.clone()), cx));
-                this.index = Some(index);
-                cx.notify();
+                this.apply_index(index, cx);
             });
         }));
+    }
+
+    fn apply_index(&mut self, index: Arc<FileIndex>, cx: &mut Context<Self>) {
+        if self.index.is_none() && crate::startup::enabled() {
+            crate::startup::mark(&format!("index ready ({} files)", index.files.len()));
+        }
+        self.search.update(cx, |search, cx| search.set_index(Some(index.clone()), cx));
+        self.index = Some(index);
+        cx.notify();
+    }
+
+    fn log(&mut self, message: impl Into<String>) {
+        self.index_log.push(LogLine { at: self.log_epoch.elapsed(), text: message.into().into() });
+        if self.index_log.len() > MAX_LOG_LINES {
+            self.index_log.remove(0);
+        }
+    }
+
+    fn toggle_index_log(&mut self, cx: &mut Context<Self>) {
+        self.index_log_open = !self.index_log_open;
+        cx.notify();
     }
 
     pub fn show_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2006,9 +2146,141 @@ impl Workspace {
         panel
     }
 
-    fn render_status_bar(&self, cx: &App) -> impl IntoElement {
+    /// Bar, count and folder while a walk runs; otherwise the file count.
+    /// Either one opens the indexing log.
+    fn render_index_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let running = self.indexing.as_ref().filter(|i| i.started.elapsed() >= INDEX_BAR_DELAY);
+        let content = match running {
+            Some(indexing) => {
+                let found = indexing.progress.files.load(std::sync::atomic::Ordering::Relaxed);
+                const BAR: f32 = 120.;
+                let (left, width) = match indexing.expected {
+                    // Known size: real fraction, held short of full until done.
+                    Some(expected) if expected > 0 => (0., BAR * (found as f32 / expected as f32).min(0.97)),
+                    // First scan: a sliding chunk, since the total is unknown.
+                    _ => {
+                        let phase = (indexing.started.elapsed().as_millis() % 1200) as f32 / 1200.;
+                        (BAR * 0.7 * phase, BAR * 0.3)
+                    }
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child("Indexing")
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(BAR))
+                            .h(px(4.))
+                            .rounded_full()
+                            .bg(ca(0xffffff, 0.1))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left(px(left))
+                                    .h_full()
+                                    .w(px(width.max(4.)))
+                                    .rounded_full()
+                                    .bg(Palette::accent()),
+                            ),
+                    )
+                    .child(format!("{found} files"))
+                    .child(
+                        div()
+                            .max_w(px(260.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(Palette::faint())
+                            .child(indexing.progress.current_dir()),
+                    )
+                    .into_any_element()
+            }
+            None => match self.index.as_ref() {
+                Some(index) => format!("{} files indexed", index.files.len()).into_any_element(),
+                None => "Indexing…".into_any_element(),
+            },
+        };
+        div()
+            .id("index-status")
+            .px(px(6.))
+            .h_full()
+            .flex()
+            .items_center()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|s| s.bg(Palette::row_hover()))
+            .child(content)
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_index_log(cx)))
+    }
+
+    fn render_index_log(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("index-log")
+            .absolute()
+            .bottom(px(STATUS_HEIGHT + 6.))
+            .left(px(8.))
+            .w(px(520.))
+            .max_h(px(260.))
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .bg(Palette::toolbar_bg())
+            .border_1()
+            .border_color(Palette::hairline())
+            .shadow_lg()
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px(px(10.))
+                    .h(px(28.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(Palette::border())
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(Palette::muted())
+                    .child("INDEXING LOG")
+                    .child(div().flex_1())
+                    .child(tool_button("index-log-close", IconName::Close, false, cx.listener(|this, _, _, cx| {
+                        this.toggle_index_log(cx)
+                    }))),
+            )
+            .child(
+                div()
+                    .id("index-log-lines")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .py(px(4.))
+                    .font_family(crate::theme::MONO_FONT)
+                    .text_size(px(11.))
+                    .children(self.index_log.iter().rev().map(|line| {
+                        div()
+                            .px(px(10.))
+                            .py(px(2.))
+                            .flex()
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .w(px(56.))
+                                    .flex_none()
+                                    .text_color(Palette::faint())
+                                    .child(format!("+{:.3}s", line.at.as_secs_f32())),
+                            )
+                            .child(div().text_color(Palette::text()).child(line.text.clone()))
+                    })),
+            )
+    }
+
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let doc = self.active.and_then(|ix| self.docs.get(ix));
         let cursor = doc.map(|doc| doc.editor.read(cx).cursor_position());
+        let index_status = self.render_index_status(cx);
         div()
             .h(px(STATUS_HEIGHT))
             .flex_none()
@@ -2031,6 +2303,7 @@ impl Workspace {
                         .child(branch),
                 )
             })
+            .child(index_status)
             .child(div().flex_1())
             .when_some(cursor, |el, cursor| {
                 el.child(format!("Ln {}, Col {}", cursor.line + 1, cursor.character + 1))
@@ -2400,6 +2673,7 @@ impl Render for Workspace {
             .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h(px(0.)).child(body))
             .when(self.root.is_some(), |el| el.child(self.render_status_bar(cx)))
+            .when(self.root.is_some() && self.index_log_open, |el| el.child(self.render_index_log(cx)))
             .when(self.build.read(cx).picker_open(), |el| {
                 // Click-away backdrop for the build target picker (the menu
                 // itself is deferred, so it paints above this).

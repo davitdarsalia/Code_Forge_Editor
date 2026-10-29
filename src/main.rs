@@ -7,6 +7,7 @@ mod build_panel;
 mod files;
 mod format;
 mod git;
+mod index_cache;
 mod languages;
 mod preview;
 mod quick_open;
