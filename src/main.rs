@@ -2,6 +2,8 @@ extern crate gpui_kit as gpui;
 
 mod file_icons;
 mod commands;
+mod build;
+mod build_panel;
 mod files;
 mod format;
 mod git;
@@ -48,6 +50,10 @@ actions!(
         FindInProject,
         FormatFile,
         CommitChanges,
+        Build,
+        CleanBuild,
+        StopBuild,
+        InstallBuild,
     ]
 );
 
@@ -84,6 +90,7 @@ const EXTRA_ICONS: &[(&str, &[u8])] = &[
     ("icons/folder-git-2.svg", include_bytes!("../assets/icons/folder-git-2.svg")),
     ("icons/undo-2.svg", include_bytes!("../assets/icons/undo-2.svg")),
     ("icons/circle-dot.svg", include_bytes!("../assets/icons/circle-dot.svg")),
+    ("icons/hammer.svg", include_bytes!("../assets/icons/hammer.svg")),
 ];
 
 impl AssetSource for Assets {
@@ -169,6 +176,13 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Open Quickly…", QuickOpenFile),
             MenuItem::action("Find in Project…", FindInProject),
         ]),
+        Menu::new("Product").items([
+            MenuItem::action("Build", Build),
+            MenuItem::action("Install (Gradle)", InstallBuild),
+            MenuItem::action("Clean Build Folder", CleanBuild),
+            MenuItem::separator(),
+            MenuItem::action("Stop", StopBuild),
+        ]),
     ]);
 }
 
@@ -248,10 +262,19 @@ fn register_actions(cx: &mut App) {
         with_workspace(cx, |ws, window, cx| ws.format_active(window, cx))
     });
 
+    use build::BuildAction;
+    cx.on_action(|_: &Build, cx| with_workspace(cx, |ws, _, cx| ws.run_build(BuildAction::Build, cx)));
+    cx.on_action(|_: &CleanBuild, cx| with_workspace(cx, |ws, _, cx| ws.run_build(BuildAction::Clean, cx)));
+    cx.on_action(|_: &InstallBuild, cx| with_workspace(cx, |ws, _, cx| ws.run_build(BuildAction::Install, cx)));
+    cx.on_action(|_: &StopBuild, cx| with_workspace(cx, |ws, _, cx| ws.stop_build(cx)));
+
     cx.bind_keys([
         // Global (no context): nothing in the editor's "Input" context binds
         // cmd-i, so this reaches the app handler from inside the editor too.
         KeyBinding::new("cmd-i", FormatFile, None),
+        KeyBinding::new("cmd-b", Build, None),
+        KeyBinding::new("cmd-shift-k", CleanBuild, None),
+        KeyBinding::new("cmd-.", StopBuild, None),
         KeyBinding::new("cmd-p", QuickOpenFile, None),
         KeyBinding::new("cmd-shift-o", QuickOpenFile, None),
         KeyBinding::new("cmd-shift-f", FindInProject, None),

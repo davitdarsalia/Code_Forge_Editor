@@ -20,6 +20,8 @@ use gpui_kit::{
 };
 
 use crate::file_icons;
+use crate::build::BuildAction;
+use crate::build_panel::{self, BuildEvent, BuildPanel};
 use crate::files::{self, Node, Row};
 use crate::git::{self, FileStatus, RepoState};
 use crate::preview::{self, Preview};
@@ -68,6 +70,13 @@ enum Navigator {
     Changes,
 }
 
+/// Which tab the bottom panel shows.
+#[derive(Clone, Copy, PartialEq)]
+enum BottomTab {
+    Terminal,
+    Build,
+}
+
 #[derive(Clone)]
 enum Notice {
     Info(SharedString),
@@ -87,6 +96,8 @@ pub struct Workspace {
     show_right: bool,
     show_terminal: bool,
     terminal: Option<Entity<Terminal>>,
+    bottom_tab: BottomTab,
+    build: Entity<BuildPanel>,
     preview: Preview,
     show_preview: bool,
     preview_task: Option<Task<()>>,
@@ -146,6 +157,16 @@ impl Workspace {
         subscriptions.push(cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
             SearchEvent::Open { path, line, column } => this.open_at(path, *line, *column, window, cx),
         }));
+        let build = cx.new(|cx| BuildPanel::new(window, cx));
+        subscriptions.push(cx.subscribe_in(&build, window, |this, _, event, window, cx| match event {
+            BuildEvent::Open { path, line, column } => this.open_at(path, *line, *column, window, cx),
+            BuildEvent::Started => {
+                this.show_terminal = true;
+                this.bottom_tab = BottomTab::Build;
+                cx.notify();
+            }
+        }));
+        subscriptions.push(cx.observe(&build, |_, _, cx| cx.notify()));
         let quick_open = cx.new(|cx| QuickOpen::new(window, cx));
         subscriptions.push(cx.subscribe_in(&quick_open, window, |this, _, event, window, cx| {
             this.quick_open_visible = false;
@@ -190,6 +211,8 @@ impl Workspace {
             show_right: true,
             show_terminal: true,
             terminal: None,
+            bottom_tab: BottomTab::Terminal,
+            build,
             preview: Preview::new(),
             show_preview: true,
             preview_task: None,
@@ -261,6 +284,7 @@ impl Workspace {
             self.ensure_terminal(window, cx);
         }
         self.refresh_git(cx);
+        self.build.update(cx, |build, cx| build.set_root(root.clone(), cx));
         self.index = None;
         self.search.update(cx, |search, cx| search.set_index(None, cx));
         self.reindex(cx);
@@ -782,6 +806,21 @@ impl Workspace {
         }
     }
 
+    // ---- Build -----------------------------------------------------------
+
+    /// ⌘B / ⇧⌘K / Install: saves everything first, like Xcode.
+    pub fn run_build(&mut self, action: BuildAction, cx: &mut Context<Self>) {
+        if self.root.is_none() {
+            return;
+        }
+        self.save_all(cx);
+        self.build.update(cx, |build, cx| build.start(action, cx));
+    }
+
+    pub fn stop_build(&mut self, cx: &mut Context<Self>) {
+        self.build.update(cx, |build, cx| build.stop(cx));
+    }
+
     // ---- Notices ---------------------------------------------------------
 
     fn notify_info(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -898,15 +937,20 @@ impl Workspace {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Forge".into());
         let branch = self.repo.as_ref().and_then(|r| r.branch.clone());
-        let status: SharedString = match &self.notice {
-            Some(Notice::Info(m)) | Some(Notice::Error(m)) => m.clone(),
-            None => match self.active.and_then(|ix| self.docs.get(ix)) {
+        let build_status = self.build.read(cx).status();
+        let status: SharedString = match (&self.notice, &build_status) {
+            (Some(Notice::Info(m)) | Some(Notice::Error(m)), _) => m.clone(),
+            (None, Some((m, _))) => m.clone(),
+            (None, None) => match self.active.and_then(|ix| self.docs.get(ix)) {
                 Some(doc) if doc.dirty => "Editing…".into(),
                 Some(_) => "Saved".into(),
                 None => "Ready".into(),
             },
         };
-        let is_error = matches!(self.notice, Some(Notice::Error(_)));
+        let is_error = match &self.notice {
+            Some(notice) => matches!(notice, Notice::Error(_)),
+            None => build_status.as_ref().is_some_and(|(_, failed)| *failed),
+        };
 
         div()
             .id("toolbar")
@@ -957,6 +1001,7 @@ impl Workspace {
                     }),
             )
             .child(div().flex_1())
+            .when(self.root.is_some(), |el| el.child(build_panel::toolbar_segment(&self.build, cx)))
             .child(
                 // Xcode-style activity pill.
                 div()
@@ -1394,12 +1439,14 @@ impl Workspace {
                     .border_b_1()
                     .border_color(Palette::border())
                     .bg(Palette::sidebar_bg())
-                    .child(icon(IconName::SquareTerminal, 13., Palette::muted()))
-                    .child(div().text_size(px(11.5)).text_color(Palette::muted()).child("Terminal"))
+                    .child(self.bottom_tab_button("bottom-terminal", IconName::SquareTerminal, "Terminal", BottomTab::Terminal, cx))
+                    .child(self.bottom_tab_button("bottom-build", IconName::Hammer, "Build", BottomTab::Build, cx))
                     .child(div().flex_1())
-                    .child(tool_button("term-restart", IconName::RotateCw, false, cx.listener(
-                        |this, _, _, cx| this.restart_terminal(cx),
-                    )))
+                    .when(self.bottom_tab == BottomTab::Terminal, |el| {
+                        el.child(tool_button("term-restart", IconName::RotateCw, false, cx.listener(
+                            |this, _, _, cx| this.restart_terminal(cx),
+                        )))
+                    })
                     .child(tool_button("term-hide", IconName::Close, false, cx.listener(
                         |this, _, window, cx| this.toggle_terminal(window, cx),
                     ))),
@@ -1408,8 +1455,43 @@ impl Workspace {
                 div()
                     .flex_1()
                     .min_h(px(0.))
-                    .when_some(self.terminal.clone(), |el, terminal| el.child(terminal)),
+                    .map(|el| match self.bottom_tab {
+                        BottomTab::Terminal => el.when_some(self.terminal.clone(), |el, terminal| el.child(terminal)),
+                        BottomTab::Build => el.child(self.build.clone()),
+                    }),
             )
+    }
+
+    fn bottom_tab_button(
+        &self,
+        id: &'static str,
+        name: IconName,
+        label: &'static str,
+        tab: BottomTab,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.bottom_tab == tab;
+        let color = if active { Palette::text() } else { Palette::muted() };
+        div()
+            .id(id)
+            .h(px(20.))
+            .px(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .rounded(px(5.))
+            .cursor_pointer()
+            .when(active, |el| el.bg(ca(0xffffff, 0.08)))
+            .hover(|s| s.bg(ca(0xffffff, 0.06)))
+            .child(icon(name, 13., color))
+            .child(div().text_size(px(11.5)).text_color(color).child(label))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.bottom_tab = tab;
+                if tab == BottomTab::Terminal {
+                    this.ensure_terminal(window, cx);
+                }
+                cx.notify();
+            }))
     }
 
     fn render_inspector(&self, cx: &App) -> impl IntoElement {
@@ -1889,6 +1971,20 @@ impl Render for Workspace {
             .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h(px(0.)).child(body))
             .when(self.root.is_some(), |el| el.child(self.render_status_bar(cx)))
+            .when(self.build.read(cx).picker_open(), |el| {
+                // Click-away backdrop for the build target picker (the menu
+                // itself is deferred, so it paints above this).
+                let build = self.build.clone();
+                el.child(
+                    div()
+                        .id("build-picker-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            build.update(cx, |build, cx| build.close_picker(cx))
+                        }),
+                )
+            })
             .when(self.clone_open, |el| el.child(self.render_clone_dialog(cx)))
             .when(self.quick_open_visible, |el| {
                 el.child(
