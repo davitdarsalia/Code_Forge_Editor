@@ -21,6 +21,7 @@ use crate::symbols::{self, Symbol};
 use crate::theme::{Palette, ca};
 
 const MAX_RESULTS: usize = 60;
+const ASYNC_FUZZY_MIN_FILES: usize = 5000;
 const MAX_TEXT_RESULTS: usize = 200;
 const TEXT_DEBOUNCE: Duration = Duration::from_millis(80);
 
@@ -127,6 +128,7 @@ pub struct QuickOpen {
     search_task: Option<Task<()>>,
     symbols: Option<Arc<Vec<Symbol>>>,
     symbols_task: Option<Task<()>>,
+    files_task: Option<Task<()>>,
     line_target: Option<(u32, u32)>,
     selected: usize,
     scroll: ScrollHandle,
@@ -162,6 +164,7 @@ impl QuickOpen {
             search_task: None,
             symbols: None,
             symbols_task: None,
+            files_task: None,
             line_target: None,
             selected: 0,
             scroll: ScrollHandle::new(),
@@ -201,8 +204,27 @@ impl QuickOpen {
         self.line_target = None;
         match mode {
             Mode::Files => {
-                if let Some(index) = self.index.as_ref() {
-                    self.hits = search::fuzzy(index, query, MAX_RESULTS);
+                self.files_task = None;
+                if let Some(index) = self.index.clone() {
+                    if query.trim().is_empty() || index.files.len() <= ASYNC_FUZZY_MIN_FILES {
+                        self.hits = search::fuzzy(&index, query, MAX_RESULTS);
+                    } else {
+                        let query = query.to_string();
+                        self.files_task = Some(cx.spawn(async move |this, cx| {
+                            let hits = cx
+                                .background_spawn(async move { search::fuzzy(&index, &query, MAX_RESULTS) })
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.files_task = None;
+                                if this.mode == Mode::Files {
+                                    this.hits = hits;
+                                    this.selected = 0;
+                                    this.scroll.scroll_to_item(0);
+                                    cx.notify();
+                                }
+                            });
+                        }));
+                    }
                 }
             }
             Mode::Text => self.schedule_search(query.to_string(), cx),
@@ -295,9 +317,9 @@ impl QuickOpen {
             self.symbols = Some(Arc::new(Vec::new()));
             return;
         };
-        let text = active.editor.read(cx).value();
+        let rope = active.editor.read(cx).text().clone();
         self.symbols_task = Some(cx.spawn(async move |this, cx| {
-            let symbols = cx.background_spawn(async move { symbols::extract(&text) }).await;
+            let symbols = cx.background_spawn(async move { symbols::extract(&rope.to_string()) }).await;
             let _ = this.update(cx, |this, cx| {
                 this.symbols = Some(Arc::new(symbols));
                 this.symbols_task = None;

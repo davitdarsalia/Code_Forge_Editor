@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const IGNORED: &[&str] = &[".git", ".DS_Store", "node_modules", "target", ".build", ".gradle", ".idea"];
 
@@ -36,43 +38,44 @@ impl Node {
     }
 
     fn load(&mut self) {
-        let mut children: Vec<Node> = match std::fs::read_dir(&self.path) {
-            Ok(entries) => entries
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| !IGNORED.contains(&entry.file_name().to_string_lossy().as_ref()))
-                .map(|entry| {
-                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    Node::new(entry.path(), is_dir)
-                })
-                .collect(),
-            Err(err) => {
-                eprintln!("forge: cannot read {}: {err}", self.path.display());
-                Vec::new()
-            }
-        };
-        children.sort_by(|a, b| {
-            b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        self.children = Some(children);
+        self.children = Some(list_dir(&self.path));
     }
 
-    pub fn refresh(&mut self) {
+    pub fn loaded_dirs(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        self.collect_loaded(&mut out);
+        out
+    }
+
+    fn collect_loaded(&self, out: &mut Vec<PathBuf>) {
+        if !self.is_dir {
+            return;
+        }
+        if let Some(children) = self.children.as_ref() {
+            out.push(self.path.clone());
+            for child in children {
+                child.collect_loaded(out);
+            }
+        }
+    }
+
+    pub fn apply_listings(&mut self, listings: &mut HashMap<PathBuf, Vec<Node>>) {
         if !self.is_dir || self.children.is_none() {
             return;
         }
-        let old = self.children.take().unwrap_or_default();
-        self.load();
-        if let Some(children) = self.children.as_mut() {
-            for child in children.iter_mut() {
-                if let Some(prev) = old.iter().find(|o| o.path == child.path) {
-                    child.expanded = prev.expanded;
-                    if prev.children.is_some() {
-                        child.load();
-                        child.refresh();
-                    }
+        let Some(fresh) = listings.remove(&self.path) else { return };
+        let mut old = self.children.take().unwrap_or_default();
+        let mut fresh = fresh;
+        for child in fresh.iter_mut() {
+            if let Some(prev) = old.iter_mut().find(|o| o.path == child.path) {
+                child.expanded = prev.expanded;
+                if prev.children.is_some() {
+                    child.children = prev.children.take();
+                    child.apply_listings(listings);
                 }
             }
         }
+        self.children = Some(fresh);
     }
 
     pub fn toggle(&mut self, path: &Path) -> bool {
@@ -236,6 +239,44 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }
 
+pub fn list_dir(path: &Path) -> Vec<Node> {
+    let mut children: Vec<Node> = match std::fs::read_dir(path) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| !IGNORED.contains(&entry.file_name().to_string_lossy().as_ref()))
+            .map(|entry| {
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                Node::new(entry.path(), is_dir)
+            })
+            .collect(),
+        Err(err) => {
+            eprintln!("forge: cannot read {}: {err}", path.display());
+            Vec::new()
+        }
+    };
+    children.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    children
+}
+
+#[derive(Default)]
+pub struct WriteGate {
+    last: Mutex<u64>,
+}
+
+impl WriteGate {
+    pub fn write(&self, seq: u64, path: &Path, contents: &[u8]) -> std::io::Result<bool> {
+        let mut last = self.last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if seq <= *last {
+            return Ok(false);
+        }
+        write_atomic(path, contents)?;
+        *last = seq;
+        Ok(true)
+    }
+}
+
 pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let path = resolved.as_path();
@@ -266,6 +307,63 @@ fn write_synced(tmp: &Path, original: &Path, contents: &[u8]) -> std::io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_gate_drops_older_sequence() {
+        let dir = std::env::temp_dir().join(format!("forge-files-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        let gate = WriteGate::default();
+        assert!(gate.write(2, &path, b"newer").unwrap());
+        assert!(!gate.write(1, &path, b"older").unwrap());
+        assert!(!gate.write(2, &path, b"dup").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
+        assert!(gate.write(3, &path, b"latest").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "latest");
+        assert!(gate.write(4, &dir.join("missing/x.txt"), b"x").is_err());
+        assert!(gate.write(4, &path, b"retry").unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_gate_orders_concurrent_writers() {
+        let dir = std::env::temp_dir().join(format!("forge-files-gate-mt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b.txt");
+        let gate = std::sync::Arc::new(WriteGate::default());
+        let handles: Vec<_> = (1..=16u64)
+            .rev()
+            .map(|seq| {
+                let (gate, path) = (gate.clone(), path.clone());
+                std::thread::spawn(move || gate.write(seq, &path, format!("v{seq}").as_bytes()).unwrap())
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v16");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_listings_keeps_expansion_and_loaded_children() {
+        let dir = std::env::temp_dir().join(format!("forge-files-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/f.txt"), "").unwrap();
+        let mut tree = Node::root(&dir);
+        assert!(tree.toggle(&dir.join("a")));
+        assert!(tree.toggle(&dir.join("a/b")));
+        std::fs::write(dir.join("a/b/g.txt"), "").unwrap();
+        std::fs::write(dir.join("new.txt"), "").unwrap();
+        let mut listings: HashMap<PathBuf, Vec<Node>> =
+            tree.loaded_dirs().into_iter().map(|p| { let l = list_dir(&p); (p, l) }).collect();
+        assert_eq!(listings.len(), 3);
+        tree.apply_listings(&mut listings);
+        let names: Vec<String> = tree.rows().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["a", "b", "f.txt", "g.txt", "new.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn write_atomic_replaces_contents_and_keeps_permissions() {
