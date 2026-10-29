@@ -11,10 +11,12 @@ mod languages;
 mod preview;
 mod quick_open;
 mod recent;
+mod scheme_cache;
 mod search;
 mod search_panel;
 mod symbols;
 mod settings;
+mod startup;
 mod terminal;
 mod theme;
 mod workspace;
@@ -528,6 +530,7 @@ fn key_bindings() -> Vec<KeyBinding> {
 }
 
 fn main() {
+    startup::init();
     let launch_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
 
     let app = gpui_kit::application().with_assets(Assets);
@@ -543,15 +546,28 @@ fn main() {
     });
 
     app.run(move |cx: &mut App| {
+        startup::mark("app.run callback");
         gpui_kit::init(cx);
+        startup::mark("gpui_kit::init");
         cx.set_global(settings::load());
         languages::register();
+        startup::mark("settings + languages");
         theme::apply(cx);
+        startup::mark("theme applied");
         register_actions(cx);
-        set_menus(cx);
+        startup::mark("actions + keybindings");
         cx.activate(true);
 
         let Some(target) = open_workspace_window(cx) else { return };
+        startup::mark("window opened");
+        // Building the native menu bar costs ~20 ms the first time; nothing
+        // shows it before the window's first frame, so do it right after.
+        update_workspace(cx, target.clone(), |_, window, _| {
+            window.on_next_frame(|_, cx| {
+                set_menus(cx);
+                startup::mark("menus built (after first frame)");
+            });
+        });
 
         let mut initial = launch_paths.clone();
         initial.extend(open_requests().1.drain().flatten());
@@ -559,6 +575,7 @@ fn main() {
             initial.extend(recent::load().into_iter().next());
         }
         update_workspace(cx, target, move |ws, window, cx| ws.open_paths(&initial, window, cx));
+        startup::mark("open_paths returned");
 
         // Finder requests that arrive while the app is running.
         cx.spawn(async move |cx| {

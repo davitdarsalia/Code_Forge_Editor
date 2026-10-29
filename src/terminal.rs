@@ -19,7 +19,9 @@ use crate::theme::{MONO_FONT, Palette, c};
 
 /// Row height relative to the font size (12.5 pt → 17 px, as before).
 const LINE_HEIGHT_RATIO: f32 = 1.36;
-const SCROLLBACK: usize = 5_000;
+/// Scrollback rows kept per terminal. Each row costs 32 bytes per column, so
+/// a full 160-column scrollback is ~10 MB at 2,000 rows (was ~26 MB at 5,000).
+const SCROLLBACK: usize = 2_000;
 const PADDING: f32 = 8.;
 
 struct Pty {
@@ -103,7 +105,11 @@ impl Terminal {
         })?;
 
         self._pump = Some(cx.spawn(async move |this, cx| {
+            let mut first = true;
             while rx.recv_async().await.is_ok() {
+                if std::mem::take(&mut first) {
+                    crate::startup::mark("terminal: first shell output");
+                }
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
                     return;
                 }

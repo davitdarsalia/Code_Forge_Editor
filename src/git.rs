@@ -6,7 +6,7 @@
 //!
 //! Every call is blocking and meant to run on the background executor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -91,13 +91,37 @@ impl RepoState {
 
     /// Number of distinct changed files (a file can be both staged and modified).
     pub fn file_count(&self) -> usize {
-        self.unstaged.len()
-            + self
-                .staged
-                .iter()
-                .filter(|s| !self.unstaged.iter().any(|u| u.path == s.path))
-                .count()
+        let unstaged: HashSet<&Path> = self.unstaged.iter().map(|u| u.path.as_path()).collect();
+        unstaged.len() + self.staged.iter().filter(|s| !unstaged.contains(s.path.as_path())).count()
     }
+
+    /// Everything the file tree and navigator badge need, computed once per
+    /// status read (off the UI thread) so rendering is lookups only.
+    pub fn tree_marks(&self) -> TreeMarks {
+        let files = self.status_map();
+        let mut dirs = HashSet::new();
+        for path in files.keys() {
+            for dir in path.ancestors().skip(1) {
+                // Stop at the work tree root and at directories already
+                // recorded (their ancestors are recorded too).
+                if !dir.starts_with(&self.workdir) || !dirs.insert(dir.to_path_buf()) {
+                    break;
+                }
+            }
+        }
+        TreeMarks { files, dirs, change_count: self.file_count() }
+    }
+}
+
+/// Precomputed git decorations for the file tree.
+#[derive(Debug, Default)]
+pub struct TreeMarks {
+    /// Absolute path -> status (see `RepoState::status_map`).
+    pub files: HashMap<PathBuf, FileStatus>,
+    /// Every directory, up to the work tree root, that contains a change.
+    pub dirs: HashSet<PathBuf>,
+    /// Distinct changed files (`RepoState::file_count`).
+    pub change_count: usize,
 }
 
 fn open(dir: &Path) -> Result<Repository> {
@@ -498,6 +522,23 @@ pub fn repo_name(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_marks_mark_every_ancestor_dir_and_count_distinct_files() {
+        let change = |path: &str, status, staged| Change { path: path.into(), status, staged };
+        let state = RepoState {
+            workdir: "/w".into(),
+            staged: vec![change("a/b/c.rs", FileStatus::Added, true), change("top.txt", FileStatus::Modified, true)],
+            unstaged: vec![change("a/b/c.rs", FileStatus::Modified, false), change("a/d.rs", FileStatus::Untracked, false)],
+            ..Default::default()
+        };
+        let marks = state.tree_marks();
+        assert_eq!(marks.change_count, 3);
+        assert_eq!(marks.files.get(Path::new("/w/a/b/c.rs")), Some(&FileStatus::Modified));
+        let mut dirs: Vec<_> = marks.dirs.iter().map(|d| d.display().to_string()).collect();
+        dirs.sort();
+        assert_eq!(dirs, ["/w", "/w/a", "/w/a/b"]);
+    }
 
     #[test]
     fn repo_name_handles_common_url_shapes() {

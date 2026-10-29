@@ -22,6 +22,9 @@ use crate::theme::{MONO_FONT, Palette, ca};
 
 /// Oldest log lines are dropped past this; issues are kept regardless.
 const MAX_LOG_LINES: usize = 20_000;
+/// Longer lines (xcodebuild prints multi-KB compiler invocations) are cut to
+/// this many bytes in the log view; issues are parsed from the full line first.
+const MAX_LINE_BYTES: usize = 2_048;
 const LOG_ROW_HEIGHT: f32 = 17.;
 const ISSUE_ROW_HEIGHT: f32 = 24.;
 
@@ -133,6 +136,7 @@ impl BuildPanel {
                     return;
                 }
                 this.detecting = false;
+                crate::startup::mark("build detection ready");
                 this.projects = projects;
                 this.select_default();
                 this.load_schemes(cx);
@@ -150,10 +154,11 @@ impl BuildPanel {
         for (ix, project) in self.projects.iter().enumerate() {
             let ProjectKind::Xcode { container, .. } = &project.kind else { continue };
             let (dir, container) = (project.dir.clone(), container.clone());
-            let task = cx.background_spawn(async move { build::list_schemes(&dir, &container) });
+            let task = cx.background_spawn(async move { crate::scheme_cache::list_schemes(&dir, &container) });
             let root = root.clone();
             self.scheme_tasks.push(cx.spawn(async move |this, cx| {
                 let result = task.await;
+                crate::startup::mark("xcodebuild -list ready");
                 let _ = this.update(cx, |this, cx| {
                     if this.root.as_ref() != Some(&root) {
                         return;
@@ -368,6 +373,7 @@ impl BuildPanel {
     }
 
     fn push_line(&mut self, line: SharedString) {
+        let line = truncate_line(line);
         if self.log.len() >= MAX_LOG_LINES {
             self.log.pop_front();
         }
@@ -762,5 +768,32 @@ impl Render for BuildPanel {
                 View::Log => self.render_log(cx),
                 View::Issues => self.render_issues(cx),
             })
+    }
+}
+
+/// Cuts `line` to `MAX_LINE_BYTES` (on a char boundary) and marks the cut.
+fn truncate_line(line: SharedString) -> SharedString {
+    if line.len() <= MAX_LINE_BYTES {
+        return line;
+    }
+    let mut end = MAX_LINE_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes)", &line[..end], line.len()).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_log_lines_are_cut_on_a_char_boundary() {
+        let short: SharedString = "ok".into();
+        assert_eq!(truncate_line(short.clone()), short);
+        let long: SharedString = "é".repeat(MAX_LINE_BYTES).into();
+        let cut = truncate_line(long);
+        assert!(cut.len() < MAX_LINE_BYTES + 32);
+        assert!(cut.ends_with(&format!("… ({} bytes)", MAX_LINE_BYTES * 2)));
     }
 }

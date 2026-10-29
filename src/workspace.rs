@@ -1,12 +1,11 @@
 //! The single window: toolbar, navigator (left), editor tabs (center),
 //! inspector (right), terminal (bottom) and status bar.
 
-use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState, Escape, Input, InputEvent, InputState, Position};
@@ -23,7 +22,7 @@ use crate::file_icons;
 use crate::build::BuildAction;
 use crate::build_panel::{self, BuildEvent, BuildPanel};
 use crate::files::{self, Node, Row};
-use crate::git::{self, FileStatus, RepoState};
+use crate::git::{self, FileStatus, RepoState, TreeMarks};
 use crate::preview::{self, Preview};
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::recent;
@@ -35,6 +34,10 @@ use gpui_kit::Focusable as _;
 use crate::theme::{Palette, ca};
 
 const GIT_REFRESH_DELAY: Duration = Duration::from_millis(600);
+/// Window activation re-reads tree, git status and the file index; skipped
+/// when the last full sync is younger than this (e.g. the activation that
+/// follows launch, or quick ⌘-Tab round trips).
+const ACTIVATION_RESYNC_MIN: Duration = Duration::from_secs(2);
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const TOOLBAR_HEIGHT: f32 = 38.;
 const STATUS_HEIGHT: f32 = 22.;
@@ -103,7 +106,11 @@ pub struct Workspace {
     show_preview: bool,
     preview_task: Option<Task<()>>,
     repo: Option<RepoState>,
-    git_status: HashMap<PathBuf, FileStatus>,
+    /// File tree git decorations, rebuilt off the UI thread per status read;
+    /// shared (not cloned) into the tree's row renderer.
+    git_marks: Rc<TreeMarks>,
+    /// When tree/git/index were last re-read (see `ACTIVATION_RESYNC_MIN`).
+    last_sync: Option<Instant>,
     git_busy: bool,
     git_task: Option<Task<()>>,
     /// Selected row in the Changes navigator: (staged section, repo-relative path).
@@ -168,6 +175,7 @@ fn external_change(path: &Path, known_mtime: Option<SystemTime>, saved_hash: u64
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        crate::startup::mark("Workspace::new start");
         let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Commit message"));
         let clone_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("https://github.com/user/repo.git")
@@ -214,8 +222,16 @@ impl Workspace {
         }));
         // Pick up edits made outside the editor (git checkout, other tools).
         subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            if crate::startup::enabled() {
+                crate::startup::mark(&format!("window active={}", window.is_window_active()));
+            }
             if window.is_window_active() {
+                // Cheap (one stat per open file): always.
                 this.reload_changed_documents(window, cx);
+                if this.last_sync.is_some_and(|at| at.elapsed() < ACTIVATION_RESYNC_MIN) {
+                    return;
+                }
+                this.last_sync = Some(Instant::now());
                 this.refresh_tree(cx);
                 this.refresh_git(cx);
                 this.reindex(cx);
@@ -237,6 +253,7 @@ impl Workspace {
             async {}
         }));
 
+        crate::startup::mark("Workspace::new children built");
         Workspace {
             root: None,
             recent: recent::load(),
@@ -256,7 +273,8 @@ impl Workspace {
             show_preview: true,
             preview_task: None,
             repo: None,
-            git_status: HashMap::new(),
+            git_marks: Rc::default(),
+            last_sync: None,
             git_busy: false,
             git_task: None,
             selected_change: None,
@@ -317,23 +335,35 @@ impl Workspace {
         self.docs.clear();
         self.active = None;
         self.repo = None;
-        self.git_status.clear();
+        self.git_marks = Rc::default();
         self.terminal = None;
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         window.set_window_title(&name);
+        crate::startup::mark("open_project: start");
         self.tree = Some(Node::root(&root));
         self.rebuild_rows();
+        crate::startup::mark("open_project: tree root loaded");
         self.root = Some(root.clone());
         self.recent = recent::push(&root);
-        crate::set_menus(cx);
-        if self.show_terminal {
-            self.ensure_terminal(window, cx);
-        }
+        // Refreshes Open Recent; off the first frame's critical path.
+        cx.on_next_frame(window, |_, _, cx| crate::set_menus(cx));
+        crate::startup::mark("open_project: recent + menus");
+        // The login shell is not needed for the first frame: spawn it right
+        // after, so opening a project paints without waiting on fork/exec.
+        cx.on_next_frame(window, |this, window, cx| {
+            if this.show_terminal && this.root.is_some() {
+                this.ensure_terminal(window, cx);
+                crate::startup::mark("terminal spawned (after first frame)");
+                cx.notify();
+            }
+        });
+        self.last_sync = Some(Instant::now());
         self.refresh_git(cx);
         self.build.update(cx, |build, cx| build.set_root(root.clone(), cx));
         self.index = None;
         self.search.update(cx, |search, cx| search.set_index(None, cx));
         self.reindex(cx);
+        crate::startup::mark("open_project: done (git/build/index queued)");
         cx.notify();
     }
 
@@ -343,7 +373,11 @@ impl Workspace {
     fn reindex(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
         let started = std::time::Instant::now();
-        let task = cx.background_spawn(async move { crate::search::build_index(&root) });
+        let task = cx.background_spawn(async move {
+            let index = crate::search::build_index(&root);
+            crate::startup::mark("bg: index walk done");
+            index
+        });
         self.index_task = Some(cx.spawn(async move |this, cx| {
             let index = Arc::new(task.await);
             let _ = this.update(cx, |this, cx| {
@@ -353,6 +387,9 @@ impl Workspace {
                 }
                 let first = this.index.is_none();
                 if first {
+                    if crate::startup::enabled() {
+                        crate::startup::mark(&format!("index ready ({} files)", index.files.len()));
+                    }
                     let message = format!("Indexed {} files in {} ms", index.files.len(), started.elapsed().as_millis());
                     this.notify_info(message, cx);
                 }
@@ -765,15 +802,17 @@ impl Workspace {
     pub fn refresh_git(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
         let task = cx.background_spawn(async move {
-            if git::is_repo(&root) { git::read_state(&root).ok() } else { None }
+            let state = if git::is_repo(&root) { git::read_state(&root).ok() } else { None };
+            let marks = state.as_ref().map(RepoState::tree_marks).unwrap_or_default();
+            crate::startup::mark("bg: git state read");
+            (state, marks)
         });
         self.git_task = Some(cx.spawn(async move |this, cx| {
-            let state = task.await;
+            let (state, marks) = task.await;
             let _ = this.update(cx, |this, cx| {
-                match state.as_ref() {
-                    Some(state) => this.git_status = state.status_map(),
-                    None => this.git_status.clear(),
-                }
+                static GIT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                crate::startup::mark_once(&GIT_READY, "git ready");
+                this.git_marks = Rc::new(marks);
                 this.repo = state;
                 cx.notify();
             });
@@ -1347,7 +1386,7 @@ impl Workspace {
     }
 
     fn render_navigator(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let change_count = self.repo.as_ref().map_or(0, |r| r.file_count());
+        let change_count = self.git_marks.change_count;
         let tab = |id: &'static str, name: IconName, nav: Navigator, cx: &mut Context<Self>| -> AnyElement {
             let active = self.navigator == nav;
             tool_button(id, name, active, cx.listener(move |this, _, _, cx| {
@@ -1411,7 +1450,7 @@ impl Workspace {
         }
         let rows = self.rows.clone();
         let active_path = self.active.and_then(|ix| self.docs.get(ix)).map(|d| d.path.clone());
-        let statuses = self.git_status.clone();
+        let marks = self.git_marks.clone();
         let scroll = self.tree_scroll.clone();
         uniform_list("file-tree", rows.len(), cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
             range
@@ -1419,12 +1458,9 @@ impl Workspace {
                     let row = rows[ix].clone();
                     let selected = active_path.as_ref() == Some(&row.path);
                     let status = if row.is_dir {
-                        statuses
-                            .iter()
-                            .any(|(p, _)| p.starts_with(&row.path))
-                            .then_some(FileStatus::Modified)
+                        marks.dirs.contains(&row.path).then_some(FileStatus::Modified)
                     } else {
-                        statuses.get(&row.path).copied()
+                        marks.files.get(&row.path).copied()
                     };
                     this.render_row(ix, row, selected, status, cx)
                 })
@@ -2283,6 +2319,11 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        static FIRST_RENDER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if crate::startup::enabled() && !FIRST_RENDER.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::startup::mark_once(&FIRST_RENDER, "first render");
+            window.on_next_frame(|_, _| crate::startup::mark("first frame drawn"));
+        }
         self.sync_settings(window, cx);
         let preview_live = self.preview_open()
             && !self.quick_open_visible
