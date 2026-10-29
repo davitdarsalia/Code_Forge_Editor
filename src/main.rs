@@ -2,6 +2,7 @@ extern crate gpui_kit as gpui;
 
 mod file_icons;
 mod files;
+mod format;
 mod git;
 mod languages;
 mod preview;
@@ -43,6 +44,7 @@ actions!(
         NewFile,
         QuickOpenFile,
         FindInProject,
+        FormatFile,
     ]
 );
 
@@ -152,6 +154,8 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::os_action("Copy", Copy, OsAction::Copy),
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action("Re-Indent / Format", FormatFile),
         ]),
         Menu::new("View").items([
             MenuItem::action("Toggle Navigator", ToggleNavigator),
@@ -234,7 +238,14 @@ fn register_actions(cx: &mut App) {
         with_workspace(cx, |ws, window, cx| ws.show_search(window, cx))
     });
 
+    cx.on_action(|_: &FormatFile, cx| {
+        with_workspace(cx, |ws, window, cx| ws.format_active(window, cx))
+    });
+
     cx.bind_keys([
+        // Global (no context): nothing in the editor's "Input" context binds
+        // cmd-i, so this reaches the app handler from inside the editor too.
+        KeyBinding::new("cmd-i", FormatFile, None),
         KeyBinding::new("cmd-p", QuickOpenFile, None),
         KeyBinding::new("cmd-shift-o", QuickOpenFile, None),
         KeyBinding::new("cmd-shift-f", FindInProject, None),
