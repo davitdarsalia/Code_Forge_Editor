@@ -5,7 +5,7 @@
 use gpui_kit::Action;
 
 use crate::{
-    ClearRecent, CloneRepository, CloseTab, CommitChanges, FindInProject, NewFile, OpenFolder,
+    ClearRecent, CloneRepository, CloseTab, FindInProject, FocusCommit, NewFile, OpenFolder,
     Quit, SaveAll, SaveFile, ToggleInspector, ToggleNavigator, TogglePreview, ToggleTerminal,
 };
 
@@ -24,7 +24,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "Save All", keys: "⌥⌘S", action: || Box::new(SaveAll) },
     Command { name: "Close Tab", keys: "⌘W", action: || Box::new(CloseTab) },
     Command { name: "Find in Project…", keys: "⇧⌘F", action: || Box::new(FindInProject) },
-    Command { name: "Commit Changes…", keys: "", action: || Box::new(CommitChanges) },
+    Command { name: "Commit Changes…", keys: "⌥⌘C", action: || Box::new(FocusCommit) },
     Command { name: "Toggle Navigator", keys: "⌘0", action: || Box::new(ToggleNavigator) },
     Command { name: "Toggle Inspector", keys: "⌥⌘0", action: || Box::new(ToggleInspector) },
     Command { name: "Toggle Terminal", keys: "⇧⌘Y", action: || Box::new(ToggleTerminal) },

@@ -62,7 +62,6 @@ actions!(
         QuickOpenFile,
         FindInProject,
         FormatFile,
-        CommitChanges,
         Build,
         CleanBuild,
         StopBuild,
@@ -336,7 +335,9 @@ fn register_actions(cx: &mut App) {
         cx.defer(|cx| {
             let windows = cx.try_global::<AppState>().map(|s| s.windows.clone()).unwrap_or_default();
             for target in windows.into_iter().filter(|(_, ws)| ws.upgrade().is_some()) {
-                update_workspace(cx, target, |ws, _, cx| ws.save_all(cx));
+                update_workspace(cx, target, |ws, _, cx| {
+                    ws.save_all(true, cx);
+                });
             }
             cx.quit();
         });
@@ -390,8 +391,12 @@ fn register_actions(cx: &mut App) {
     cx.on_action(|_: &CloneRepository, cx| {
         with_workspace_or_new(cx, |ws, window, cx| ws.show_clone(window, cx))
     });
-    cx.on_action(|_: &SaveFile, cx| with_workspace(cx, |ws, _, cx| ws.save_all(cx)));
-    cx.on_action(|_: &SaveAll, cx| with_workspace(cx, |ws, _, cx| ws.save_all(cx)));
+    cx.on_action(|_: &SaveFile, cx| with_workspace(cx, |ws, _, cx| {
+        ws.save_all(true, cx);
+    }));
+    cx.on_action(|_: &SaveAll, cx| with_workspace(cx, |ws, _, cx| {
+        ws.save_all(true, cx);
+    }));
     cx.on_action(|_: &CloseTab, cx| {
         if !close_settings_if_active(cx) {
             with_workspace(cx, |ws, window, cx| ws.close_active(window, cx))
@@ -420,9 +425,6 @@ fn register_actions(cx: &mut App) {
     });
     cx.on_action(|_: &FindInProject, cx| {
         with_workspace(cx, |ws, window, cx| ws.show_search(window, cx))
-    });
-    cx.on_action(|_: &CommitChanges, cx| {
-        with_workspace(cx, |ws, window, cx| ws.show_commit(window, cx))
     });
 
     cx.on_action(|_: &FormatFile, cx| {
@@ -528,14 +530,17 @@ fn main() {
     });
 }
 
+/// Decodes `%XX` escapes of a `file://` URL path. Works on bytes so a `%`
+/// followed by non-ASCII text cannot split a UTF-8 character.
 fn percent_decode(input: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                out.push(byte);
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
@@ -544,4 +549,19 @@ fn percent_decode(input: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_handles_escapes_and_non_ascii() {
+        assert_eq!(percent_decode("/Users/me/My%20Project"), "/Users/me/My Project");
+        assert_eq!(percent_decode("/a/%C3%A9t%C3%A9"), "/a/été");
+        // A `%` before multi-byte text used to slice inside a char and panic.
+        assert_eq!(percent_decode("/a/%é%"), "/a/%é%");
+        assert_eq!(percent_decode("/a/100%"), "/a/100%");
+        assert_eq!(percent_decode("/a/%zz"), "/a/%zz");
+    }
 }

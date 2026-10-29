@@ -109,7 +109,24 @@ fn save_to(path: &Path, settings: &Settings) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(settings).map_err(std::io::Error::other)?;
-    std::fs::write(path, bytes)
+    crate::files::write_atomic(path, &bytes)
+}
+
+/// Generation of the newest settings handed to a background save.
+static SAVE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Generation last written; the lock also keeps two writes from interleaving.
+static SAVED_GENERATION: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+/// Saves on a pool thread can run in any order (typing "500" in the autosave
+/// field queues three); an older snapshot must never land after a newer one.
+fn save_generation(path: &Path, settings: &Settings, generation: u64) -> std::io::Result<()> {
+    let mut saved = SAVED_GENERATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if generation <= *saved {
+        return Ok(());
+    }
+    save_to(path, settings)?;
+    *saved = generation;
+    Ok(())
 }
 
 /// Replaces the global settings, persists them and redraws every window so
@@ -123,8 +140,9 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
     }
     if let Some(path) = store_path() {
         let snapshot = settings.clone();
+        let generation = SAVE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         cx.background_spawn(async move {
-            if let Err(err) = save_to(&path, &snapshot) {
+            if let Err(err) = save_generation(&path, &snapshot, generation) {
                 eprintln!("forge: failed to save settings: {err}");
             }
         })
@@ -290,6 +308,19 @@ mod tests {
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), settings);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn older_save_never_overwrites_a_newer_one() {
+        let dir = std::env::temp_dir().join(format!("forge-settings-gen-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let base = *SAVED_GENERATION.lock().unwrap();
+        let newer = Settings { autosave_delay_ms: 500, ..Settings::default() };
+        let older = Settings { autosave_delay_ms: 5, ..Settings::default() };
+        save_generation(&path, &newer, base + 2).unwrap();
+        save_generation(&path, &older, base + 1).unwrap();
+        assert_eq!(load_from(&path), newer);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -137,7 +137,12 @@ impl Terminal {
 
     fn kill(&mut self) {
         if let Some(mut pty) = self.pty.take() {
-            let _ = pty.child.kill();
+            let running = matches!(pty.child.try_wait(), Ok(None));
+            if let Err(err) = pty.child.kill() {
+                if running {
+                    eprintln!("forge: cannot stop the shell: {err}");
+                }
+            }
         }
         self._pump = None;
     }
@@ -210,7 +215,7 @@ impl Terminal {
 
     fn paste(&mut self, text: &str) {
         let bracketed = self.parser.lock().unwrap().screen().bracketed_paste();
-        let text = text.replace("\r\n", "\r").replace('\n', "\r");
+        let text = paste_text(text, bracketed);
         if bracketed {
             self.write(b"\x1b[200~");
             self.write(text.as_bytes());
@@ -364,6 +369,14 @@ impl Render for Terminal {
     }
 }
 
+/// Normalises newlines and, for bracketed paste, strips the end marker so a
+/// pasted `ESC[201~` cannot end the paste early and run the rest as typed
+/// commands (xterm does the same).
+fn paste_text(text: &str, bracketed: bool) -> String {
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed { text.replace("\x1b[201~", "").replace("\x1b[200~", "") } else { text }
+}
+
 fn mono_font() -> Font {
     font(MONO_FONT)
 }
@@ -493,6 +506,13 @@ fn keystroke_bytes(keystroke: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bracketed_paste_cannot_be_terminated_by_the_payload() {
+        let hostile = "echo hi\x1b[201~rm -rf ~\n";
+        assert_eq!(paste_text(hostile, true), "echo hirm -rf ~\r");
+        assert_eq!(paste_text("a\r\nb\nc", false), "a\rb\rc");
+    }
 
     #[test]
     fn xterm_cube_and_gray() {

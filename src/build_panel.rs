@@ -72,6 +72,17 @@ pub struct BuildPanel {
 
 impl EventEmitter<BuildEvent> for BuildPanel {}
 
+/// Closing the window (or quitting, which drops every window) must not leave
+/// xcodebuild/Gradle running: the build sits in its own process group, so no
+/// terminal hangup reaches it.
+impl Drop for BuildPanel {
+    fn drop(&mut self) {
+        if let Some(run) = self.run.take() {
+            run.stop();
+        }
+    }
+}
+
 impl BuildPanel {
     pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
         BuildPanel {

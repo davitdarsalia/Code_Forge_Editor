@@ -478,14 +478,21 @@ pub fn clone(url: &str, parent: &Path) -> Result<PathBuf> {
     if target.exists() {
         bail!("{} already exists", target.display());
     }
-    git(parent, &["clone", url, &name])?;
+    // `--` keeps the URL and folder from being read as options
+    // (`--upload-pack=<cmd>` would run a command).
+    git(parent, &["clone", "--", url.trim(), &name])?;
     Ok(target)
 }
 
 pub fn repo_name(url: &str) -> Option<String> {
-    let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let trimmed = url.trim();
+    if trimmed.starts_with('-') {
+        return None;
+    }
+    let trimmed = trimmed.trim_end_matches('/').trim_end_matches(".git");
     let name = trimmed.rsplit(['/', ':']).next()?;
-    (!name.is_empty()).then(|| name.to_string())
+    // The name becomes a folder next to others: no `.`/`..`, no option.
+    (!name.is_empty() && name != "." && name != ".." && !name.starts_with('-')).then(|| name.to_string())
 }
 
 #[cfg(test)]
@@ -498,6 +505,25 @@ mod tests {
         assert_eq!(repo_name("git@github.com:a/b.git").as_deref(), Some("b"));
         assert_eq!(repo_name("https://github.com/a/b/").as_deref(), Some("b"));
         assert_eq!(repo_name("  ").as_deref(), None);
+    }
+
+    #[test]
+    fn repo_name_rejects_option_like_urls_and_dot_names() {
+        assert_eq!(repo_name("--upload-pack=touch /tmp/pwned"), None);
+        assert_eq!(repo_name(" -c core.sshCommand=x"), None);
+        assert_eq!(repo_name("https://host/a/.."), None);
+        assert_eq!(repo_name("https://host/-rf"), None);
+    }
+
+    #[test]
+    fn clone_refuses_option_injection() {
+        let parent = std::env::temp_dir().join(format!("forge-git-clone-{}", std::process::id()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let marker = parent.join("pwned");
+        let url = format!("--upload-pack=touch {}", marker.display());
+        assert!(clone(&url, &parent).is_err());
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(&parent).unwrap();
     }
 
     #[test]

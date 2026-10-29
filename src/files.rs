@@ -253,16 +253,50 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = dir.join(format!(".{name}.forge-tmp"));
-    std::fs::write(&tmp, contents)?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    let result = write_synced(&tmp, path, contents).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        if let Err(err) = std::fs::remove_file(&tmp) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("forge: cannot remove {}: {err}", tmp.display());
+            }
+        }
     }
-    std::fs::rename(&tmp, path)
+    result
+}
+
+/// Writes `tmp` with the permissions of `original` and flushes it to disk, so
+/// the rename never publishes a file whose data is still only in the cache.
+fn write_synced(tmp: &Path, original: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(tmp)?;
+    file.write_all(contents)?;
+    if let Ok(meta) = std::fs::metadata(original) {
+        // Losing the executable bit of a script would be a silent change.
+        file.set_permissions(meta.permissions())?;
+    }
+    file.sync_all()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_atomic_replaces_contents_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("forge-files-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.sh");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(!dir.join(".run.sh.forge-tmp").exists());
+        // A failed write leaves no temp file behind.
+        assert!(write_atomic(&dir.join("missing/x.txt"), b"x").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// File names sampled from the DMote repo (iOS + Android + fastlane).
     #[test]

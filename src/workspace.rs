@@ -14,7 +14,7 @@ use gpui_kit::base::{Spring, spring};
 use gpui_kit::component::Icon;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, MouseButton, MouseMoveEvent, Context, Entity, ExternalPaths, FocusHandle,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, PromptLevel,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
     ScrollStrategy, UniformListScrollHandle, canvas, div, prelude::FluentBuilder as _, px, uniform_list,
 };
@@ -58,6 +58,8 @@ struct Document {
     saved_hash: u64,
     dirty: bool,
     mtime: Option<SystemTime>,
+    /// Autosave found the file changed on disk and left it alone; reported once.
+    conflict: bool,
     save_task: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -140,6 +142,30 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+#[derive(Debug, PartialEq)]
+enum ExternalChange {
+    /// On disk as we last loaded or saved it (or gone: saving recreates it).
+    None,
+    /// Touched but same content: adopt the new mtime.
+    Touched(Option<SystemTime>),
+    /// Someone else rewrote it since we loaded or saved it.
+    Changed,
+}
+
+/// Compares the file on disk with the version a document last loaded/saved.
+fn external_change(path: &Path, known_mtime: Option<SystemTime>, saved_hash: u64) -> ExternalChange {
+    let current = mtime(path);
+    if current.is_none() || current == known_mtime {
+        return ExternalChange::None;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) if hash_text(&text) == saved_hash => ExternalChange::Touched(current),
+        Ok(_) => ExternalChange::Changed,
+        // Unreadable now: let the write report the real error.
+        Err(_) => ExternalChange::None,
+    }
+}
+
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Commit message"));
@@ -198,8 +224,21 @@ impl Workspace {
                 this.refresh_git(cx);
                 this.reindex(cx);
             } else {
-                this.save_all(cx);
+                this.save_all(false, cx);
             }
+        }));
+        // Closing the window or quitting (also via the Dock or a logout, which
+        // bypass the Quit action) keeps what the user typed.
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            if let Some(workspace) = weak.upgrade() {
+                workspace.update(cx, |ws, cx| ws.save_all(true, cx));
+            }
+            true
+        });
+        subscriptions.push(cx.on_app_quit(|this, cx| {
+            this.save_all(true, cx);
+            async {}
         }));
 
         Workspace {
@@ -274,7 +313,11 @@ impl Workspace {
         if self.root.as_ref() == Some(&root) {
             return;
         }
-        self.save_all(cx);
+        // The open documents are dropped below: never lose unsaved edits.
+        if !self.save_all(false, cx) {
+            self.notify_error("Some files could not be saved; save (⌘S) or close them before switching projects", cx);
+            return;
+        }
         self.docs.clear();
         self.active = None;
         self.repo = None;
@@ -335,17 +378,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Reveals the Changes navigator with the commit message focused.
-    pub fn show_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.root.is_none() {
-            return;
-        }
-        self.show_left = true;
-        self.navigator = Navigator::Changes;
-        self.commit_input.update(cx, |input, cx| input.focus(window, cx));
-        cx.notify();
-    }
-
     pub fn show_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.root.is_none() {
             return;
@@ -394,7 +426,14 @@ impl Workspace {
             self.notify_error(format!("{} looks like a binary file", path.display()), cx);
             return;
         }
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        // Lossy decoding would rewrite every non-UTF-8 byte on the next autosave.
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                self.notify_error(format!("{} is not UTF-8 text; not opened to avoid corrupting it", path.display()), cx);
+                return;
+            }
+        };
         let saved_hash = hash_text(&text);
         let language = files::detect_language(path, &text);
         let editor = cx.new(|cx| {
@@ -412,7 +451,9 @@ impl Workspace {
                 this.schedule_save(id, cx);
                 this.schedule_preview(id, window, cx);
             }
-            InputEvent::Blur => this.save_doc(id, cx),
+            InputEvent::Blur => {
+                this.save_doc(id, false, cx);
+            }
             _ => {}
         });
         self.docs.push(Document {
@@ -422,6 +463,7 @@ impl Workspace {
             saved_hash,
             dirty: false,
             mtime: mtime(path),
+            conflict: false,
             save_task: None,
             _subscription: subscription,
         });
@@ -444,7 +486,32 @@ impl Workspace {
     pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.active else { return };
         let id = self.docs[ix].id;
-        self.save_doc(id, cx);
+        if !self.save_doc(id, false, cx) {
+            // Unsaved edits would be lost: only close when the user says so.
+            let name = self.docs[ix].path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                &format!("“{name}” was not saved"),
+                Some("It could not be written or it changed on disk. Close it and lose your edits?"),
+                &["Close Without Saving", "Cancel"],
+                cx,
+            );
+            cx.spawn_in(window, async move |this, cx| {
+                if answer.await == Ok(0) {
+                    let result = this.update_in(cx, |this, window, cx| this.remove_doc(id, window, cx));
+                    if let Err(err) = result {
+                        eprintln!("forge: cannot close tab: {err}");
+                    }
+                }
+            })
+            .detach();
+            return;
+        }
+        self.remove_doc(id, window, cx);
+    }
+
+    fn remove_doc(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.docs.iter().position(|d| d.id == id) else { return };
         self.docs.remove(ix);
         self.active = if self.docs.is_empty() { None } else { Some(ix.min(self.docs.len() - 1)) };
         if let Some(ix) = self.active {
@@ -467,13 +534,18 @@ impl Workspace {
         // Replacing the task drops (cancels) the previous timer: a debounce.
         doc.save_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            let _ = this.update(cx, |this, cx| this.save_doc(id, cx));
+            let _ = this.update(cx, |this, cx| this.save_doc(id, false, cx));
         }));
         cx.notify();
     }
 
-    fn save_doc(&mut self, id: usize, cx: &mut Context<Self>) {
-        let Some(ix) = self.docs.iter().position(|d| d.id == id) else { return };
+    /// Writes the buffer if it differs from what was last saved. Returns
+    /// whether the buffer is now safely on disk. Without `force` a file that
+    /// changed on disk since it was loaded is left alone (an autosave must not
+    /// clobber a `git checkout` run in the terminal); ⌘S, closing the window
+    /// and quitting pass `force` and overwrite it.
+    fn save_doc(&mut self, id: usize, force: bool, cx: &mut Context<Self>) -> bool {
+        let Some(ix) = self.docs.iter().position(|d| d.id == id) else { return true };
         let text = self.docs[ix].editor.read(cx).value();
         let hash = hash_text(&text);
         let doc = &mut self.docs[ix];
@@ -483,28 +555,53 @@ impl Workspace {
                 doc.dirty = false;
                 cx.notify();
             }
-            return;
+            return true;
         }
-        match files::write_atomic(&doc.path, text.as_bytes()) {
+        if !force {
+            match external_change(&doc.path, doc.mtime, doc.saved_hash) {
+                ExternalChange::None => {}
+                ExternalChange::Touched(mtime) => doc.mtime = mtime,
+                ExternalChange::Changed => {
+                    let first = !doc.conflict;
+                    doc.conflict = true;
+                    if first {
+                        let message = format!(
+                            "{} changed on disk; your edits are not saved. ⌘S overwrites it.",
+                            doc.path.display()
+                        );
+                        self.notify_error(message, cx);
+                    }
+                    return false;
+                }
+            }
+        }
+        let saved = match files::write_atomic(&doc.path, text.as_bytes()) {
             Ok(()) => {
                 doc.saved_hash = hash;
                 doc.dirty = false;
+                doc.conflict = false;
                 doc.mtime = mtime(&doc.path);
                 self.schedule_git_refresh(cx);
+                true
             }
             Err(err) => {
                 let message = format!("Save failed for {}: {err}", doc.path.display());
                 self.notify_error(message, cx);
+                false
             }
-        }
+        };
         cx.notify();
+        saved
     }
 
-    pub fn save_all(&mut self, cx: &mut Context<Self>) {
+    /// Saves every document; `false` if any could not be saved.
+    pub fn save_all(&mut self, force: bool, cx: &mut Context<Self>) -> bool {
         let ids: Vec<usize> = self.docs.iter().map(|d| d.id).collect();
+        let mut all = true;
         for id in ids {
-            self.save_doc(id, cx);
+            all &= self.save_doc(id, force, cx);
         }
+        all
     }
 
     fn reload_changed_documents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -695,7 +792,7 @@ impl Workspace {
         if self.git_busy {
             return;
         }
-        self.save_all(cx);
+        self.save_all(false, cx);
         self.git_busy = true;
         self.notice = Some(Notice::Info(format!("{label}…").into()));
         cx.notify();
@@ -727,6 +824,36 @@ impl Workspace {
         self.run_git("Commit", move |root| git::commit(root, &message, true), window, cx);
     }
 
+    /// Discard cannot be undone (untracked files are deleted), so it always
+    /// asks first; the button sits right next to "stage".
+    fn confirm_discard(&mut self, change: git::Change, window: &mut Window, cx: &mut Context<Self>) {
+        let name = change.path.display().to_string();
+        let detail = if change.status == FileStatus::Untracked {
+            "The file is untracked and will be deleted. This cannot be undone."
+        } else {
+            "Your changes to this file will be lost. This cannot be undone."
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Discard changes to “{name}”?"),
+            Some(detail),
+            &["Discard Changes", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let result = this.update_in(cx, |this, window, cx| {
+                this.run_git("Discard", move |root| git::discard(root, &change).map(|_| String::new()), window, cx)
+            });
+            if let Err(err) = result {
+                eprintln!("forge: discard dropped: {err}");
+            }
+        })
+        .detach();
+    }
+
     /// Quick index edits (stage/unstage). Unlike `run_git` these don't post a
     /// "finished" notice; the refreshed lists are the feedback.
     fn run_index_op(
@@ -739,7 +866,7 @@ impl Workspace {
             return;
         }
         // Stage what the editor shows, not a stale on-disk version.
-        self.save_all(cx);
+        self.save_all(false, cx);
         let task = cx.background_spawn(async move { op(&root) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -847,7 +974,7 @@ impl Workspace {
         if self.root.is_none() {
             return;
         }
-        self.save_all(cx);
+        self.save_all(false, cx);
         self.build.update(cx, |build, cx| build.start(action, cx));
     }
 
@@ -1504,13 +1631,7 @@ impl Workspace {
                 .child(action_button(("discard", ix), IconName::Undo2).on_click(cx.listener(
                     move |this, _, window, cx| {
                         cx.stop_propagation();
-                        let change = change_for_discard.clone();
-                        this.run_git(
-                            "Discard",
-                            move |root| git::discard(root, &change).map(|_| String::new()),
-                            window,
-                            cx,
-                        );
+                        this.confirm_discard(change_for_discard.clone(), window, cx);
                     },
                 )))
                 .child(action_button(("stage", ix), IconName::Plus).on_click(cx.listener(
@@ -2229,5 +2350,34 @@ impl Render for Workspace {
                         .child(self.quick_open.clone()),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_change_detects_rewrites_but_not_touches() {
+        let dir = std::env::temp_dir().join(format!("forge-ws-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "one").unwrap();
+        let loaded = mtime(&path);
+        let saved_hash = hash_text("one");
+        assert_eq!(external_change(&path, loaded, saved_hash), ExternalChange::None);
+
+        // Same content, newer mtime (e.g. `touch`, a no-op checkout).
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        assert!(matches!(external_change(&path, Some(old), saved_hash), ExternalChange::Touched(Some(_))));
+
+        // Rewritten by someone else: an autosave must not overwrite it.
+        std::fs::write(&path, "two").unwrap();
+        assert_eq!(external_change(&path, Some(old), saved_hash), ExternalChange::Changed);
+
+        // Deleted: saving simply recreates it.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(external_change(&path, loaded, saved_hash), ExternalChange::None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

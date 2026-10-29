@@ -575,7 +575,7 @@ fn signal_group(pid: i32, signal: libc::c_int) {
 /// the exit arrive on `tx` from reader threads; nothing polls.
 pub fn spawn(command: &CommandLine, tx: flume::Sender<RunEvent>) -> anyhow::Result<RunHandle> {
     use std::os::unix::process::CommandExt as _;
-    let shell = std::env::var("SHELL").ok().filter(|s| !s.ends_with("fish")).unwrap_or_else(|| "/bin/zsh".into());
+    let shell = login_shell(std::env::var("SHELL").ok().as_deref());
     let mut child = Command::new(shell);
     child
         .arg("-l")
@@ -623,6 +623,16 @@ pub fn spawn(command: &CommandLine, tx: flume::Sender<RunEvent>) -> anyhow::Resu
     Ok(RunHandle { pid, exited })
 }
 
+/// The user's shell when it is POSIX-like; `exec "$0" "$@"` (which keeps the
+/// arguments out of shell parsing) means nothing to fish, csh or nushell.
+fn login_shell(shell: Option<&str>) -> String {
+    const POSIX: &[&str] = &["sh", "bash", "zsh", "ksh", "dash"];
+    shell
+        .filter(|s| s.starts_with('/') && POSIX.contains(&s.rsplit('/').next().unwrap_or_default()))
+        .unwrap_or("/bin/zsh")
+        .to_string()
+}
+
 fn read_lines(stream: Box<dyn Read + Send>, tx: flume::Sender<RunEvent>) {
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
@@ -648,6 +658,40 @@ fn read_lines(stream: Box<dyn Read + Send>, tx: flume::Sender<RunEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_shell_falls_back_for_non_posix_shells() {
+        assert_eq!(login_shell(Some("/opt/homebrew/bin/bash")), "/opt/homebrew/bin/bash");
+        assert_eq!(login_shell(Some("/bin/zsh")), "/bin/zsh");
+        assert_eq!(login_shell(Some("/opt/homebrew/bin/fish")), "/bin/zsh");
+        assert_eq!(login_shell(Some("/bin/tcsh")), "/bin/zsh");
+        assert_eq!(login_shell(Some("nu")), "/bin/zsh");
+        assert_eq!(login_shell(None), "/bin/zsh");
+    }
+
+    /// Scheme names and paths reach the program as argv, never as shell text.
+    #[test]
+    fn spawn_passes_hostile_arguments_verbatim() {
+        let dir = temp_dir("argv");
+        let marker = dir.join("pwned");
+        let hostile = format!("x\"; touch {}; echo \"$(touch {})", marker.display(), marker.display());
+        let command = CommandLine { program: "/bin/echo".into(), args: vec![hostile.clone()], cwd: dir.clone() };
+        let (tx, rx) = flume::unbounded();
+        spawn(&command, tx).unwrap();
+        let mut lines = Vec::new();
+        for event in rx.iter() {
+            match event {
+                RunEvent::Line(text, _) => lines.push(text),
+                RunEvent::Exited(code) => {
+                    assert_eq!(code, Some(0));
+                    break;
+                }
+                RunEvent::Failed(message) => panic!("{message}"),
+            }
+        }
+        assert!(lines.contains(&hostile), "{lines:?}");
+        assert!(!marker.exists());
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forge-build-test-{name}-{}", std::process::id()));
