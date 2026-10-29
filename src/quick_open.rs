@@ -1,7 +1,7 @@
 //! ⌘P: fuzzy file finder over the project index.
 
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
@@ -14,6 +14,7 @@ use gpui_kit::{
     prelude::FluentBuilder as _, px,
 };
 
+use crate::file_icons;
 use crate::search::{self, FileIndex, FuzzyHit};
 use crate::theme::{Palette, ca};
 
@@ -155,7 +156,7 @@ impl Render for QuickOpen {
                                 .cursor_pointer()
                                 .when(selected, |el| el.bg(Palette::row_selected()))
                                 .when(!selected, |el| el.hover(|s| s.bg(Palette::row_hover())))
-                                .child(Icon::new(IconName::FileCode).size(px(14.)).text_color(Palette::muted()))
+                                .child(file_icons::file_icon_img(Path::new(path)))
                                 .child(
                                     div()
                                         .text_size(px(13.))

@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +18,7 @@ use gpui_kit::{
     Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 
+use crate::file_icons;
 use crate::search::{self, FileIndex, FileMatches, SearchHandle, SearchOptions};
 use crate::theme::{Palette, ca};
 
@@ -239,7 +240,7 @@ impl SearchPanel {
                                 .size(px(11.))
                                 .text_color(Palette::faint()),
                         )
-                        .child(Icon::new(IconName::FileCode).size(px(13.)).text_color(Palette::muted()))
+                        .child(file_icons::file_icon_img(Path::new(&name)))
                         .child(div().font_weight(FontWeight::MEDIUM).text_color(Palette::text()).whitespace_nowrap().child(name))
                         .child(
                             div()

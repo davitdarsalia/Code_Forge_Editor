@@ -19,6 +19,7 @@ use gpui_kit::{
     canvas, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 
+use crate::file_icons;
 use crate::files::{self, Node, Row};
 use crate::git::{self, FileStatus, RepoState};
 use crate::preview::{self, Preview};
@@ -999,10 +1000,10 @@ impl Workspace {
     ) -> AnyElement {
         let indent = 8. + row.depth as f32 * 14.;
         let chevron = if row.expanded { IconName::ChevronDown } else { IconName::ChevronRight };
-        let (kind_icon, kind_color) = if row.is_dir {
-            (IconName::Folder, Palette::folder())
+        let kind_icon = if row.is_dir {
+            file_icons::folder_icon_img(&row.path, row.expanded)
         } else {
-            (IconName::FileCode, Palette::muted())
+            file_icons::file_icon_img(&row.path)
         };
         let name_color = match status {
             Some(status) if !row.is_dir => status_color(status),
@@ -1024,7 +1025,7 @@ impl Workspace {
             .child(
                 div().w(px(12.)).flex_none().when(row.is_dir, |el| el.child(icon(chevron, 11., Palette::faint()))),
             )
-            .child(icon(kind_icon, 14., kind_color))
+            .child(kind_icon)
             .child(
                 div()
                     .flex_1()
@@ -1208,7 +1209,7 @@ impl Workspace {
                     .cursor_pointer()
                     .when(active, |el| el.bg(Palette::tab_active()).text_color(Palette::text()))
                     .when(!active, |el| el.text_color(Palette::muted()).hover(|s| s.bg(Palette::row_hover())))
-                    .child(icon(IconName::FileCode, 12., if active { Palette::accent() } else { Palette::faint() }))
+                    .child(file_icons::file_icon_img(&doc.path))
                     .child(name)
                     .child(
                         div()

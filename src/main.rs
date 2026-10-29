@@ -1,5 +1,6 @@
 extern crate gpui_kit as gpui;
 
+mod file_icons;
 mod files;
 mod git;
 mod languages;
@@ -82,7 +83,7 @@ const EXTRA_ICONS: &[(&str, &[u8])] = &[
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
-        if let Some((_, bytes)) = EXTRA_ICONS.iter().find(|(p, _)| *p == path) {
+        if let Some((_, bytes)) = EXTRA_ICONS.iter().chain(file_icons::ASSETS).find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
         gpui_kit::assets::Assets.load(path)
@@ -90,7 +91,7 @@ impl AssetSource for Assets {
 
     fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
         let mut list = gpui_kit::assets::Assets.list(path)?;
-        list.extend(EXTRA_ICONS.iter().filter(|(p, _)| p.starts_with(path)).map(|(p, _)| (*p).into()));
+        list.extend(EXTRA_ICONS.iter().chain(file_icons::ASSETS).filter(|(p, _)| p.starts_with(path)).map(|(p, _)| (*p).into()));
         Ok(list)
     }
 }
