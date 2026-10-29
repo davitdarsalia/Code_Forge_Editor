@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, Position};
 use gpui_kit::base::{Spring, spring};
 use gpui_kit::component::Icon;
 use gpui_kit::{
@@ -99,6 +99,7 @@ pub struct Workspace {
     clone_busy: bool,
     notice: Option<Notice>,
     notice_task: Option<Task<()>>,
+    format_task: Option<Task<()>>,
     index: Option<Arc<FileIndex>>,
     index_task: Option<Task<()>>,
     search: Entity<SearchPanel>,
@@ -191,6 +192,7 @@ impl Workspace {
             clone_busy: false,
             notice: None,
             notice_task: None,
+            format_task: None,
             index: None,
             index_task: None,
             search,
@@ -467,6 +469,69 @@ impl Workspace {
         }
         self.refresh_preview(window, cx);
         cx.notify();
+    }
+
+    // ---- Format (⌘I) ------------------------------------------------------
+
+    /// Formats the active file off the UI thread and applies the result if
+    /// the buffer did not change meanwhile.
+    pub fn format_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = self.active_doc() else { return };
+        let (id, path) = (doc.id, doc.path.clone());
+        let text = doc.editor.read(cx).value().to_string();
+        let language = files::language_for(&path);
+        let before = hash_text(&text);
+        // Replacing the task cancels a format still in flight.
+        self.format_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let outcome = cx
+                .background_spawn(async move { crate::format::format(&path, language, &text) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| this.apply_format(id, before, outcome, window, cx));
+        }));
+    }
+
+    fn apply_format(
+        &mut self,
+        id: usize,
+        before: u64,
+        outcome: crate::format::Outcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::format::Outcome;
+        self.format_task = None;
+        let Some(doc) = self.docs.iter().find(|d| d.id == id) else { return };
+        let editor = doc.editor.clone();
+        let (text, notice) = match outcome {
+            Outcome::Changed { text, notice } => (text, notice),
+            Outcome::Unchanged { notice } => {
+                if let Some(notice) = notice {
+                    self.notify_info(notice, cx);
+                }
+                return;
+            }
+            Outcome::Failed(message) => {
+                self.notify_error(message, cx);
+                return;
+            }
+        };
+        if hash_text(&editor.read(cx).value()) != before {
+            self.notify_info("File changed while formatting; press ⌘I again", cx);
+            return;
+        }
+        editor.update(cx, |state, cx| {
+            let cursor = state.cursor_position();
+            // replace_all keeps undo history, so ⌘Z reverts the format.
+            state.replace_all(text.clone(), window, cx);
+            let last_line = text.split('\n').count().saturating_sub(1) as u32;
+            let line = cursor.line.min(last_line);
+            // The column is clamped to the line length by the editor.
+            state.set_cursor_position(Position { line, character: cursor.character }, window, cx);
+        });
+        self.schedule_save(id, cx);
+        if let Some(notice) = notice {
+            self.notify_info(notice, cx);
+        }
     }
 
     // ---- Preview canvas --------------------------------------------------
