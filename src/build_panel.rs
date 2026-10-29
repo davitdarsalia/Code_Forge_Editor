@@ -17,6 +17,7 @@ use crate::build::{
     self, BuildAction, BuildProject, Destination, Issue, IssueSet, ModuleKind, ProjectKind, RunEvent, RunHandle,
     Severity,
 };
+use crate::file_icons;
 use crate::theme::{MONO_FONT, Palette, ca};
 
 /// Oldest log lines are dropped past this; issues are kept regardless.
@@ -256,6 +257,12 @@ impl BuildPanel {
 
     // ---- Running ---------------------------------------------------------
 
+    /// Whether an Xcode or Gradle project was found (the toolbar segment is
+    /// hidden otherwise).
+    pub fn has_projects(&self) -> bool {
+        !self.projects.is_empty()
+    }
+
     pub fn is_running(&self) -> bool {
         matches!(self.state, RunState::Running { .. })
     }
@@ -446,7 +453,12 @@ fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
     Icon::new(name).size(px(size)).text_color(color)
 }
 
-fn segment_button(id: &'static str, name: IconName, enabled: bool, on_click: impl Fn(&mut App) + 'static) -> AnyElement {
+fn segment_button(
+    id: &'static str,
+    name: IconName,
+    enabled: bool,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> AnyElement {
     div()
         .id(id)
         .flex()
@@ -458,7 +470,7 @@ fn segment_button(id: &'static str, name: IconName, enabled: bool, on_click: imp
             el.cursor_pointer()
                 .hover(|s| s.bg(ca(0xffffff, 0.08)))
                 .active(|s| s.bg(ca(0xffffff, 0.14)))
-                .on_click(move |_, _, cx| on_click(cx))
+                .on_click(move |_, window, cx| on_click(window, cx))
         })
         .child(icon(name, 15., if enabled { Palette::text() } else { Palette::faint() }))
         .into_any_element()
@@ -471,17 +483,18 @@ pub fn toolbar_segment(build: &Entity<BuildPanel>, cx: &App) -> AnyElement {
     let has_target = panel.selected.is_some();
     let label = panel.target_label();
     let open = panel.picker_open;
-    let (b1, b2, b3) = (build.clone(), build.clone(), build.clone());
+    let b3 = build.clone();
     div()
         .flex()
         .items_center()
         .gap(px(2.))
         .mr(px(8.))
-        .child(segment_button("build-run", IconName::Play, has_target, move |cx| {
-            b1.update(cx, |b, cx| b.start(BuildAction::Build, cx))
+        // Same path as ⌘B / ⌘. so the toolbar also saves open files first.
+        .child(segment_button("build-run", IconName::Play, has_target, |window, cx| {
+            window.dispatch_action(Box::new(crate::Build), cx)
         }))
-        .child(segment_button("build-stop", IconName::Square, running, move |cx| {
-            b2.update(cx, |b, cx| b.stop(cx))
+        .child(segment_button("build-stop", IconName::Square, running, |window, cx| {
+            window.dispatch_action(Box::new(crate::StopBuild), cx)
         }))
         .child(
             div()
@@ -674,8 +687,9 @@ impl BuildPanel {
                                     .text_color(Palette::text())
                                     .child(issue.message.clone()),
                             )
-                            .when_some(location, |el, location| {
-                                el.child(div().flex_none().text_color(Palette::muted()).child(location))
+                            .when_some(issue.path.as_ref().zip(location), |el, (path, location)| {
+                                el.child(file_icons::file_icon_img(path))
+                                    .child(div().flex_none().text_color(Palette::muted()).child(location))
                             })
                             .into_any_element(),
                     )
