@@ -151,6 +151,16 @@ impl Workspace {
             this.quick_open_visible = false;
             match event {
                 QuickOpenEvent::Open(path) => this.open_file(&path.clone(), window, cx),
+                QuickOpenEvent::OpenAt { path, line, column } => this.open_at(&path.clone(), *line, *column, window, cx),
+                QuickOpenEvent::Run(action) => {
+                    // Give focus back first so the action dispatches from the window, not the closed overlay.
+                    if this.active_doc().is_some() {
+                        this.focus_active_editor(window, cx);
+                    } else {
+                        window.focus(&this.focus, cx);
+                    }
+                    window.dispatch_action(action.boxed_clone(), cx);
+                }
                 QuickOpenEvent::Dismiss => this.focus_active_editor(window, cx),
             }
             cx.notify();
@@ -289,7 +299,19 @@ impl Workspace {
         }
         self.quick_open_visible = true;
         let index = self.index.clone();
-        self.quick_open.update(cx, |q, cx| q.show(index, window, cx));
+        let active = self.active_doc().map(|doc| (doc.path.clone(), doc.editor.clone()));
+        self.quick_open.update(cx, |q, cx| q.show(index, active, window, cx));
+        cx.notify();
+    }
+
+    /// Reveals the Changes navigator with the commit message focused.
+    pub fn show_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.root.is_none() {
+            return;
+        }
+        self.show_left = true;
+        self.navigator = Navigator::Changes;
+        self.commit_input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
 
