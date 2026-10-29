@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, Position};
+use gpui_kit::component::input::{Editor, EditorState, Escape, Input, InputEvent, InputState, Position};
 use gpui_kit::base::{Spring, spring};
 use gpui_kit::component::Icon;
 use gpui_kit::{
@@ -179,11 +179,7 @@ impl Workspace {
                 QuickOpenEvent::OpenAt { path, line, column } => this.open_at(&path.clone(), *line, *column, window, cx),
                 QuickOpenEvent::Run(action) => {
                     // Give focus back first so the action dispatches from the window, not the closed overlay.
-                    if this.active_doc().is_some() {
-                        this.focus_active_editor(window, cx);
-                    } else {
-                        window.focus(&this.focus, cx);
-                    }
+                    this.focus_active_editor(window, cx);
                     window.dispatch_action(action.boxed_clone(), cx);
                 }
                 QuickOpenEvent::Dismiss => this.focus_active_editor(window, cx),
@@ -335,17 +331,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Reveals the Changes navigator with the commit message focused.
-    pub fn show_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.root.is_none() {
-            return;
-        }
-        self.show_left = true;
-        self.navigator = Navigator::Changes;
-        self.commit_input.update(cx, |input, cx| input.focus(window, cx));
-        cx.notify();
-    }
-
     pub fn show_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.root.is_none() {
             return;
@@ -367,9 +352,12 @@ impl Workspace {
         });
     }
 
+    /// Where focus goes back to after an overlay, dialog or panel closes:
+    /// the active editor, else the workspace itself so shortcuts keep working.
     fn focus_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(doc) = self.active.and_then(|ix| self.docs.get(ix)) {
-            doc.editor.update(cx, |state, cx| state.focus(window, cx));
+        match self.active.and_then(|ix| self.docs.get(ix)) {
+            Some(doc) => doc.editor.update(cx, |state, cx| state.focus(window, cx)),
+            None => window.focus(&self.focus, cx),
         }
     }
 
@@ -716,6 +704,23 @@ impl Workspace {
         .detach();
     }
 
+    /// Pull / Push / Fetch from the Source Control menu and the Changes panel.
+    pub fn run_remote(
+        &mut self,
+        label: &'static str,
+        op: fn(&Path) -> anyhow::Result<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.repo.is_none() {
+            if self.root.is_some() {
+                self.notify_error("Not a git repository", cx);
+            }
+            return;
+        }
+        self.run_git(label, op, window, cx);
+    }
+
     fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let message = self.commit_input.read(cx).value().trim().to_string();
         if message.is_empty() {
@@ -758,6 +763,16 @@ impl Workspace {
     pub fn show_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clone_open = true;
         self.clone_input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Cancel / Escape / click-away. A running clone keeps the dialog open.
+    fn close_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.clone_busy {
+            return;
+        }
+        self.clone_open = false;
+        self.focus_active_editor(window, cx);
         cx.notify();
     }
 
@@ -817,10 +832,16 @@ impl Workspace {
         self.show_terminal = !self.show_terminal;
         if self.show_terminal {
             self.ensure_terminal(window, cx);
-            if let Some(terminal) = self.terminal.as_ref() {
-                let focus = terminal.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
+            // Only grab focus when the shell is the visible tab, not the build log.
+            if self.bottom_tab == BottomTab::Terminal {
+                if let Some(terminal) = self.terminal.as_ref() {
+                    let focus = terminal.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
+                }
             }
+        } else {
+            // Don't leave keystrokes going to a hidden shell.
+            self.focus_active_editor(window, cx);
         }
         cx.notify();
     }
@@ -860,6 +881,7 @@ impl Workspace {
     /// Shows the terminal (starting it if needed) and moves focus into it.
     pub fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_terminal = true;
+        self.bottom_tab = BottomTab::Terminal;
         self.ensure_terminal(window, cx);
         if let Some(terminal) = self.terminal.as_ref() {
             let focus = terminal.read(cx).focus_handle(cx);
@@ -1014,7 +1036,7 @@ fn text_button(
         .when(primary, |el| {
             el.bg(Palette::accent())
                 .text_color(gpui_kit::white())
-                .hover(|s| s.bg(crate::theme::c(0x2a95ff)))
+                .hover(|s| s.bg(Palette::accent_hover()))
         })
         .when(!primary, |el| {
             el.bg(ca(0xffffff, 0.08))
@@ -1148,12 +1170,17 @@ impl Workspace {
                     }),
             )
             .child(div().flex_1())
-            .when(self.root.is_some(), |el| el.child(build_panel::toolbar_segment(&self.build, cx)))
+            // Hidden until an Xcode or Gradle project is detected.
+            .when(self.root.is_some() && self.build.read(cx).has_projects(), |el| {
+                el.child(build_panel::toolbar_segment(&self.build, cx))
+            })
             .child(
                 // Xcode-style activity pill.
                 div()
                     .h(px(24.))
-                    .min_w(px(260.))
+                    // Shrinks before the build segment and toggles get pushed out.
+                    .flex_shrink(1.)
+                    .min_w(px(160.))
                     .max_w(px(520.))
                     .px(px(12.))
                     .flex()
@@ -1476,6 +1503,7 @@ impl Workspace {
                     .text_color(status_color(change.status))
                     .child(change.status.letter()),
             )
+            .child(file_icons::file_icon_img(&change.path))
             .child(div().text_color(Palette::text()).whitespace_nowrap().child(name))
             .child(
                 div()
@@ -1610,7 +1638,7 @@ impl Workspace {
                 )
                 .when(self.preview_open(), |el| {
                     el.child(drag_handle("handle-preview", Drag::Preview, cx))
-                        .child(self.render_preview())
+                        .child(self.render_preview(cx))
                 })
                 .into_any_element(),
             None => div()
@@ -1635,8 +1663,11 @@ impl Workspace {
     /// Pane the native web view is laid over. The web view draws above all
     /// GPUI content, so it is hidden while overlays are open or the pane edge
     /// is dragged (it would swallow the mouse).
-    fn render_preview(&self) -> impl IntoElement {
-        let live = !self.quick_open_visible && !self.clone_open && self.drag != Some(Drag::Preview);
+    fn render_preview(&self, cx: &App) -> impl IntoElement {
+        let live = !self.quick_open_visible
+            && !self.clone_open
+            && !self.build.read(cx).picker_open()
+            && self.drag != Some(Drag::Preview);
         div()
             .w(px(self.preview_width))
             .flex_none()
@@ -1957,11 +1988,11 @@ impl Workspace {
             .items_start()
             .justify_center()
             .pt(px(120.))
-            .on_click(cx.listener(|this, _, _, cx| {
-                if !this.clone_busy {
-                    this.clone_open = false;
-                    cx.notify();
-                }
+            .on_click(cx.listener(|this, _, window, cx| this.close_clone(window, cx)))
+            // Capture phase: the URL field would otherwise consume Escape.
+            .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                this.close_clone(window, cx);
+                cx.stop_propagation();
             }))
             .child(
                 div()
@@ -2003,9 +2034,8 @@ impl Workspace {
                             .flex()
                             .justify_end()
                             .gap(px(8.))
-                            .child(text_button("clone-cancel", "Cancel", false, cx.listener(|this, _, _, cx| {
-                                this.clone_open = false;
-                                cx.notify();
+                            .child(text_button("clone-cancel", "Cancel", false, cx.listener(|this, _, window, cx| {
+                                this.close_clone(window, cx)
                             })))
                             .child(text_button(
                                 "clone-go",
@@ -2125,6 +2155,7 @@ impl Render for Workspace {
         let preview_live = self.preview_open()
             && !self.quick_open_visible
             && !self.clone_open
+            && !self.build.read(cx).picker_open()
             && self.drag != Some(Drag::Preview);
         if !preview_live {
             self.preview.hide();
@@ -2192,7 +2223,7 @@ impl Render for Workspace {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.open_paths(paths.paths(), window, cx);
             }))
-            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(ca(0x0a84ff, 0.08)))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(Palette::drop_target()))
             .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h(px(0.)).child(body))
             .when(self.root.is_some(), |el| el.child(self.render_status_bar(cx)))

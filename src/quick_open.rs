@@ -494,7 +494,7 @@ impl QuickOpen {
                     .text_size(px(11.5))
                     .font_weight(FontWeight::MEDIUM)
                     .cursor_pointer()
-                    .when(on, |el| el.bg(ca(0x0a84ff, 0.3)).text_color(gpui_kit::white()))
+                    .when(on, |el| el.bg(Palette::chip_active()).text_color(gpui_kit::white()))
                     .when(!on, |el| el.text_color(Palette::muted()).hover(|s| s.bg(ca(0xffffff, 0.08))))
                     .child(mode.label())
                     .when(!mode.prefix().is_empty(), |el| {
@@ -604,7 +604,7 @@ impl QuickOpen {
                     .map(|&(start, end)| {
                         (start..end, HighlightStyle {
                             color: Some(gpui_kit::white()),
-                            background_color: Some(ca(0xd9a54a, 0.45)),
+                            background_color: Some(Palette::match_bg()),
                             font_weight: Some(FontWeight::SEMIBOLD),
                             ..Default::default()
                         })
@@ -642,7 +642,7 @@ impl QuickOpen {
         vec![
             self.row(0, cx)
                 .h(px(30.))
-                .child(Icon::new(IconName::ArrowRight).size(px(14.)).text_color(Palette::muted()))
+                .child(file_icons::file_icon_img(&active.path))
                 .child(
                     div()
                         .text_size(px(13.))

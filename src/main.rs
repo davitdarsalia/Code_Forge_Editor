@@ -62,11 +62,15 @@ actions!(
         QuickOpenFile,
         FindInProject,
         FormatFile,
-        CommitChanges,
+        GitPull,
+        GitPush,
+        GitFetch,
         Build,
         CleanBuild,
         StopBuild,
         InstallBuild,
+        Minimize,
+        Zoom,
     ]
 );
 
@@ -209,6 +213,15 @@ fn open_workspace_window(cx: &mut App) -> Option<(AnyWindowHandle, WeakEntity<Wo
     }
 }
 
+fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window) + 'static) {
+    cx.defer(move |cx| {
+        let Some(handle) = cx.active_window() else { return };
+        if let Err(err) = handle.update(cx, |_, window, _| f(window)) {
+            eprintln!("forge: window is gone: {err}");
+        }
+    });
+}
+
 fn open_settings(cx: &mut App) {
     let existing = cx.try_global::<AppState>().and_then(|s| s.settings_window);
     if let Some(window) = existing {
@@ -293,11 +306,7 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
             MenuItem::separator(),
-            MenuItem::action("Re-Indent / Format", FormatFile),
-        ]),
-        Menu::new("Find").items([
-            MenuItem::action("Find in Project…", FindInProject),
-            MenuItem::action("Open Quickly…", QuickOpenFile),
+            MenuItem::action("Format File", FormatFile),
         ]),
         Menu::new("View").items([
             MenuItem::submenu(Menu::new("Navigators").items([
@@ -313,6 +322,21 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Focus Terminal", FocusTerminal),
             MenuItem::action("New Terminal", NewTerminal),
         ]),
+        // Open Quickly lives in File only (as in Xcode), not duplicated here.
+        Menu::new("Find").items([MenuItem::action("Find in Project…", FindInProject)]),
+        Menu::new("Navigate").items([
+            MenuItem::action("Reveal in Navigator", RevealInNavigator),
+            MenuItem::separator(),
+            MenuItem::action("Show Next Tab", NextTab),
+            MenuItem::action("Show Previous Tab", PreviousTab),
+        ]),
+        Menu::new("Source Control").items([
+            MenuItem::action("Commit…", FocusCommit),
+            MenuItem::separator(),
+            MenuItem::action("Pull", GitPull),
+            MenuItem::action("Push", GitPush),
+            MenuItem::action("Fetch", GitFetch),
+        ]),
         Menu::new("Product").items([
             MenuItem::action("Build", Build),
             MenuItem::action("Install (Gradle)", InstallBuild),
@@ -320,13 +344,10 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Stop", StopBuild),
         ]),
-        Menu::new("Navigate").items([
-            MenuItem::action("Reveal in Navigator", RevealInNavigator),
-            MenuItem::separator(),
-            MenuItem::action("Show Next Tab", NextTab),
-            MenuItem::action("Show Previous Tab", PreviousTab),
+        Menu::new("Window").items([
+            MenuItem::action("Minimize", Minimize),
+            MenuItem::action("Zoom", Zoom),
         ]),
-        Menu::new("Source Control").items([MenuItem::action("Commit…", FocusCommit)]),
     ]);
 }
 
@@ -421,9 +442,12 @@ fn register_actions(cx: &mut App) {
     cx.on_action(|_: &FindInProject, cx| {
         with_workspace(cx, |ws, window, cx| ws.show_search(window, cx))
     });
-    cx.on_action(|_: &CommitChanges, cx| {
-        with_workspace(cx, |ws, window, cx| ws.show_commit(window, cx))
-    });
+    cx.on_action(|_: &GitPull, cx| with_workspace(cx, |ws, window, cx| ws.run_remote("Pull", git::pull, window, cx)));
+    cx.on_action(|_: &GitPush, cx| with_workspace(cx, |ws, window, cx| ws.run_remote("Push", git::push, window, cx)));
+    cx.on_action(|_: &GitFetch, cx| with_workspace(cx, |ws, window, cx| ws.run_remote("Fetch", git::fetch, window, cx)));
+    // Window menu: acts on whichever window is in front (Settings included).
+    cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
+    cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
 
     cx.on_action(|_: &FormatFile, cx| {
         with_workspace(cx, |ws, window, cx| ws.format_active(window, cx))
@@ -435,21 +459,30 @@ fn register_actions(cx: &mut App) {
     cx.on_action(|_: &InstallBuild, cx| with_workspace(cx, |ws, _, cx| ws.run_build(BuildAction::Install, cx)));
     cx.on_action(|_: &StopBuild, cx| with_workspace(cx, |ws, _, cx| ws.stop_build(cx)));
 
-    // Keybindings dispatch before key-down listeners, so these also fire while
-    // the terminal is focused. The menu shows the FIRST binding of an action,
-    // so the canonical one is listed first and fallbacks after.
-    cx.bind_keys([
+    cx.bind_keys(key_bindings());
+}
+
+/// Every app shortcut. The command palette's hints (`commands.rs`) are
+/// checked against this list by a test.
+///
+/// Keybindings dispatch before key-down listeners, so these also fire while
+/// the terminal is focused. The menu shows the FIRST binding of an action,
+/// so the canonical one is listed first and fallbacks after.
+fn key_bindings() -> Vec<KeyBinding> {
+    vec![
         // Global (no context): nothing in the editor's "Input" context binds
         // cmd-i, so this reaches the app handler from inside the editor too.
         KeyBinding::new("cmd-i", FormatFile, None),
         KeyBinding::new("cmd-b", Build, None),
         KeyBinding::new("cmd-shift-k", CleanBuild, None),
+        KeyBinding::new("cmd-shift-i", InstallBuild, None),
         KeyBinding::new("cmd-.", StopBuild, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-shift-n", NewWindow, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-shift-o", QuickOpenFile, None),
+        // ⌘P first so menus show it; ⇧⌘O is the Xcode alias.
         KeyBinding::new("cmd-p", QuickOpenFile, None),
+        KeyBinding::new("cmd-shift-o", QuickOpenFile, None),
         KeyBinding::new("cmd-shift-f", FindInProject, None),
         KeyBinding::new("cmd-n", NewFile, None),
         KeyBinding::new("cmd-o", OpenFolder, None),
@@ -475,11 +508,17 @@ fn register_actions(cx: &mut App) {
         KeyBinding::new("ctrl-~", NewTerminal, None),
         KeyBinding::new("cmd-alt-enter", TogglePreview, None),
         KeyBinding::new("cmd-alt-c", FocusCommit, None),
+        KeyBinding::new("cmd-alt-x", GitPull, None),
+        KeyBinding::new("cmd-alt-p", GitPush, None),
+        KeyBinding::new("cmd-alt-f", GitFetch, None),
+        KeyBinding::new("cmd-m", Minimize, None),
         // The text input binds ⌘⇧F to Replace in its "Input" context, which
         // outranks context-free bindings; re-bind it there (added later, so it
         // wins) so Find in Project works from the editor too.
         KeyBinding::new("cmd-shift-f", FindInProject, Some("Input")),
-    ]);
+        // Same for ⌘. (the input maps it to code actions, which Forge has none of).
+        KeyBinding::new("cmd-.", StopBuild, Some("Input")),
+    ]
 }
 
 fn main() {

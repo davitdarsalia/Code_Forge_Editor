@@ -27,6 +27,13 @@ impl Palette {
     pub fn muted() -> Hsla { c(0x8e8e93) }
     pub fn faint() -> Hsla { c(0x5c5c61) }
     pub fn accent() -> Hsla { c(0x0a84ff) }
+    pub fn accent_hover() -> Hsla { c(0x2a95ff) }
+    /// Selected segment of a chip/tab group (⌘P modes, search options).
+    pub fn chip_active() -> Hsla { ca(0x0a84ff, 0.3) }
+    /// Background behind matched text in search results.
+    pub fn match_bg() -> Hsla { ca(0xd9a54a, 0.45) }
+    /// Tint of the window while files are dragged over it.
+    pub fn drop_target() -> Hsla { ca(0x0a84ff, 0.08) }
     pub fn row_selected() -> Hsla { ca(0x0a84ff, 0.32) }
     pub fn row_hover() -> Hsla { ca(0xffffff, 0.05) }
     pub fn tab_active() -> Hsla { c(0x1f1f24) }
@@ -54,7 +61,7 @@ pub fn apply(cx: &mut App) {
     theme.input = Palette::hairline();
     theme.muted_foreground = Palette::muted();
     theme.primary = Palette::accent();
-    theme.primary_hover = c(0x2a95ff);
+    theme.primary_hover = Palette::accent_hover();
     theme.primary_active = c(0x0070e0);
     theme.primary_foreground = c(0xffffff);
     theme.selection = ca(0x0a84ff, 0.35);
