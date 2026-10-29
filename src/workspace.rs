@@ -79,6 +79,12 @@ struct Document {
     mtime: Option<SystemTime>,
     conflict: bool,
     save_task: Option<Task<()>>,
+    save_seq: u64,
+    applied_seq: u64,
+    edit_gen: u64,
+    saving: bool,
+    resave: bool,
+    gate: Arc<files::WriteGate>,
     definitions: Option<Rc<lsp::Definitions>>,
     _subscription: Subscription,
 }
@@ -139,6 +145,8 @@ pub struct Workspace {
     notice: Option<Notice>,
     notice_task: Option<Task<()>>,
     format_task: Option<Task<()>>,
+    reload_task: Option<Task<()>>,
+    tree_task: Option<Task<()>>,
     index: Option<Arc<FileIndex>>,
     index_task: Option<Task<()>>,
     cache_task: Option<Task<()>>,
@@ -191,6 +199,67 @@ fn external_change(path: &Path, known_mtime: Option<SystemTime>, saved_hash: u64
         Ok(text) if hash_text(&text) == saved_hash => ExternalChange::Touched(current),
         Ok(_) => ExternalChange::Changed,
         Err(_) => ExternalChange::None,
+    }
+}
+
+struct LoadedText {
+    text: String,
+    saved_hash: u64,
+    language: &'static str,
+    mtime: Option<SystemTime>,
+}
+
+fn load_text(path: &Path) -> Result<LoadedText, String> {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if size > MAX_FILE_BYTES {
+        return Err(format!("{} is too large to open", path.display()));
+    }
+    let before = mtime(path);
+    let bytes = std::fs::read(path).map_err(|err| format!("Cannot open {}: {err}", path.display()))?;
+    if files::looks_binary(&bytes) {
+        return Err(format!("{} looks like a binary file", path.display()));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("{} is not UTF-8 text; not opened to avoid corrupting it", path.display()))?;
+    let saved_hash = hash_text(&text);
+    let language = files::detect_language(path, &text);
+    Ok(LoadedText { text, saved_hash, language, mtime: before })
+}
+
+#[derive(Debug, PartialEq)]
+enum SaveOutcome {
+    Unchanged,
+    Conflict,
+    Superseded,
+    Written { hash: u64, mtime: Option<SystemTime> },
+    Failed { message: String, touched: Option<Option<SystemTime>> },
+}
+
+fn run_save(
+    text: &str,
+    path: &Path,
+    known_mtime: Option<SystemTime>,
+    saved_hash: u64,
+    check_external: bool,
+    seq: u64,
+    gate: &files::WriteGate,
+) -> SaveOutcome {
+    let hash = hash_text(text);
+    if hash == saved_hash {
+        return SaveOutcome::Unchanged;
+    }
+    let mut touched = None;
+    if check_external {
+        match external_change(path, known_mtime, saved_hash) {
+            ExternalChange::None => {}
+            ExternalChange::Touched(mtime) => touched = Some(mtime),
+            ExternalChange::Changed => return SaveOutcome::Conflict,
+        }
+    }
+    match gate.write(seq, path, text.as_bytes()) {
+        Ok(true) => SaveOutcome::Written { hash, mtime: mtime(path) },
+        Ok(false) => SaveOutcome::Superseded,
+        Err(err) => SaveOutcome::Failed { message: format!("Save failed for {}: {err}", path.display()), touched },
     }
 }
 
@@ -254,7 +323,10 @@ impl Workspace {
                 this.refresh_git(cx);
                 this.reindex(cx);
             } else {
-                this.save_all(false, cx);
+                let ids: Vec<usize> = this.docs.iter().filter(|d| d.dirty).map(|d| d.id).collect();
+                for id in ids {
+                    this.save_doc_async(id, cx);
+                }
             }
         }));
         let weak = cx.weak_entity();
@@ -301,6 +373,8 @@ impl Workspace {
             notice: None,
             notice_task: None,
             format_task: None,
+            reload_task: None,
+            tree_task: None,
             index: None,
             index_task: None,
             cache_task: None,
@@ -539,13 +613,15 @@ impl Workspace {
     }
 
     fn open_at(&mut self, path: &Path, line: u32, column: u32, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_file(path, window, cx);
-        let Some(doc) = self.active.and_then(|ix| self.docs.get(ix)) else { return };
-        if doc.path != path {
-            return;
-        }
-        doc.editor.update(cx, |state, cx| {
-            state.set_cursor_position(gpui_kit::component::input::Position { line, character: column }, window, cx)
+        let owned = path.to_path_buf();
+        self.open_file_then(path, window, cx, move |this, window, cx| {
+            let Some(doc) = this.active.and_then(|ix| this.docs.get(ix)) else { return };
+            if doc.path != owned {
+                return;
+            }
+            doc.editor.update(cx, |state, cx| {
+                state.set_cursor_position(gpui_kit::component::input::Position { line, character: column }, window, cx)
+            });
         });
     }
 
@@ -557,35 +633,46 @@ impl Workspace {
     }
 
     pub fn open_file(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_then(path, window, cx, |_, _, _| {});
+    }
+
+    fn open_file_then(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if let Some(ix) = self.docs.iter().position(|d| d.path == path) {
+            self.activate(ix, window, cx);
+            then(self, window, cx);
+            return;
+        }
+        let path = path.to_path_buf();
+        cx.spawn_in(window, async move |this, cx| {
+            let read_path = path.clone();
+            let loaded = cx.background_spawn(async move { load_text(&read_path) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let loaded = match loaded {
+                    Ok(loaded) => loaded,
+                    Err(message) => {
+                        this.notify_error(message, cx);
+                        return;
+                    }
+                };
+                this.finish_open(&path, loaded, window, cx);
+                then(this, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_open(&mut self, path: &Path, loaded: LoadedText, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.docs.iter().position(|d| d.path == path) {
             self.activate(ix, window, cx);
             return;
         }
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        if size > MAX_FILE_BYTES {
-            self.notify_error(format!("{} is too large to open", path.display()), cx);
-            return;
-        }
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                self.notify_error(format!("Cannot open {}: {err}", path.display()), cx);
-                return;
-            }
-        };
-        if files::looks_binary(&bytes) {
-            self.notify_error(format!("{} looks like a binary file", path.display()), cx);
-            return;
-        }
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => {
-                self.notify_error(format!("{} is not UTF-8 text; not opened to avoid corrupting it", path.display()), cx);
-                return;
-            }
-        };
-        let saved_hash = hash_text(&text);
-        let language = files::detect_language(path, &text);
+        let LoadedText { text, saved_hash, language, mtime: loaded_mtime } = loaded;
         let definitions = lsp::Kind::for_language(language).map(|kind| {
             Rc::new(lsp::Definitions {
                 manager: Rc::downgrade(&self.lsp),
@@ -620,7 +707,9 @@ impl Workspace {
                 this.schedule_preview(id, window, cx);
             }
             InputEvent::Blur => {
-                this.save_doc(id, false, cx);
+                if this.docs.iter().any(|d| d.id == id && d.dirty) {
+                    this.save_doc_async(id, cx);
+                }
             }
             _ => {}
         });
@@ -630,9 +719,15 @@ impl Workspace {
             editor,
             saved_hash,
             dirty: false,
-            mtime: mtime(path),
+            mtime: loaded_mtime,
             conflict: false,
             save_task: None,
+            save_seq: 0,
+            applied_seq: 0,
+            edit_gen: 0,
+            saving: false,
+            resave: false,
+            gate: Arc::new(files::WriteGate::default()),
             definitions,
             _subscription: subscription,
         });
@@ -674,33 +769,40 @@ impl Workspace {
 
     fn jump_to(&mut self, path: &Path, lsp_start: Position, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.nav_point(cx);
-        if !self.open_navigated(path, window, cx) {
-            return;
-        }
-        let Some(doc) = self.active_doc() else { return };
-        let position = {
-            let text = doc.editor.read(cx).text();
-            let line = if (lsp_start.line as usize) < text.lines_len() {
-                text.slice_line(lsp_start.line as usize).to_string()
-            } else {
-                String::new()
+        self.open_navigated(path, window, cx, move |this, window, cx| {
+            let Some(doc) = this.active_doc() else { return };
+            let position = {
+                let text = doc.editor.read(cx).text();
+                let line = if (lsp_start.line as usize) < text.lines_len() {
+                    text.slice_line(lsp_start.line as usize).to_string()
+                } else {
+                    String::new()
+                };
+                Position { line: lsp_start.line, character: lsp::char_column(&line, lsp_start.character) }
             };
-            Position { line: lsp_start.line, character: lsp::char_column(&line, lsp_start.character) }
-        };
-        doc.editor.update(cx, |state, cx| state.set_cursor_position(position, window, cx));
-        if let Some(from) = from {
-            Self::push_history(&mut self.back, from);
-            self.forward.clear();
-        }
+            doc.editor.update(cx, |state, cx| state.set_cursor_position(position, window, cx));
+            if let Some(from) = from {
+                Self::push_history(&mut this.back, from);
+                this.forward.clear();
+            }
+        });
     }
 
-    fn open_navigated(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.open_file(path, window, cx);
-        let Some(doc) = self.active_doc().filter(|doc| doc.path == path) else { return false };
-        if self.lsp.is_external(path) {
-            doc.editor.update(cx, |state, cx| state.set_readonly(true, cx));
-        }
-        true
+    fn open_navigated(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let owned = path.to_path_buf();
+        self.open_file_then(path, window, cx, move |this, window, cx| {
+            let Some(doc) = this.active_doc().filter(|doc| doc.path == owned) else { return };
+            if this.lsp.is_external(&owned) {
+                doc.editor.update(cx, |state, cx| state.set_readonly(true, cx));
+            }
+            then(this, window, cx);
+        });
     }
 
     pub fn go_to_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -744,12 +846,12 @@ impl Workspace {
         if let Some(here) = self.nav_point(cx) {
             Self::push_history(if back { &mut self.forward } else { &mut self.back }, here);
         }
-        if !self.open_navigated(&target.path, window, cx) {
-            return;
-        }
-        if let Some(doc) = self.active_doc() {
-            doc.editor.update(cx, |state, cx| state.set_cursor_position(target.position, window, cx));
-        }
+        let position = target.position;
+        self.open_navigated(&target.path, window, cx, move |this, window, cx| {
+            if let Some(doc) = this.active_doc() {
+                doc.editor.update(cx, |state, cx| state.set_cursor_position(position, window, cx));
+            }
+        });
     }
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -806,55 +908,104 @@ impl Workspace {
         let delay = Settings::get(cx).autosave_delay();
         let Some(doc) = self.docs.iter_mut().find(|d| d.id == id) else { return };
         doc.dirty = true;
+        doc.edit_gen += 1;
         doc.save_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            let _ = this.update(cx, |this, cx| this.save_doc(id, false, cx));
+            let _ = this.update(cx, |this, cx| this.save_doc_async(id, cx));
         }));
         cx.notify();
+    }
+
+    fn save_doc_async(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(ix) = self.docs.iter().position(|d| d.id == id) else { return };
+        let doc = &mut self.docs[ix];
+        doc.save_task = None;
+        if doc.saving {
+            doc.resave = true;
+            return;
+        }
+        doc.saving = true;
+        doc.save_seq += 1;
+        let seq = doc.save_seq;
+        let edit_gen = doc.edit_gen;
+        let rope = doc.editor.read(cx).text().clone();
+        let (path, known_mtime, saved_hash, gate) = (doc.path.clone(), doc.mtime, doc.saved_hash, doc.gate.clone());
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_spawn(async move {
+                    let text = rope.to_string();
+                    run_save(&text, &path, known_mtime, saved_hash, true, seq, &gate)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_save(id, seq, edit_gen, outcome, cx);
+                let again = this.docs.iter_mut().find(|d| d.id == id).is_some_and(|doc| {
+                    doc.saving = false;
+                    std::mem::take(&mut doc.resave)
+                });
+                if again {
+                    this.save_doc_async(id, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn save_doc(&mut self, id: usize, force: bool, cx: &mut Context<Self>) -> bool {
         let Some(ix) = self.docs.iter().position(|d| d.id == id) else { return true };
         let text = self.docs[ix].editor.read(cx).value();
-        let hash = hash_text(&text);
         let doc = &mut self.docs[ix];
         doc.save_task = None;
-        if hash == doc.saved_hash {
-            if doc.dirty {
-                doc.dirty = false;
-                cx.notify();
-            }
+        doc.save_seq += 1;
+        let seq = doc.save_seq;
+        let edit_gen = doc.edit_gen;
+        let check = !force && !doc.saving;
+        let outcome = run_save(&text, &doc.path, doc.mtime, doc.saved_hash, check, seq, &doc.gate);
+        self.apply_save(id, seq, edit_gen, outcome, cx)
+    }
+
+    fn apply_save(&mut self, id: usize, seq: u64, edit_gen: u64, outcome: SaveOutcome, cx: &mut Context<Self>) -> bool {
+        let Some(ix) = self.docs.iter().position(|d| d.id == id) else { return true };
+        let doc = &mut self.docs[ix];
+        if seq < doc.applied_seq {
             return true;
         }
-        if !force {
-            match external_change(&doc.path, doc.mtime, doc.saved_hash) {
-                ExternalChange::None => {}
-                ExternalChange::Touched(mtime) => doc.mtime = mtime,
-                ExternalChange::Changed => {
-                    let first = !doc.conflict;
-                    doc.conflict = true;
-                    if first {
-                        let message = format!(
-                            "{} changed on disk; your edits are not saved. ⌘S overwrites it.",
-                            doc.path.display()
-                        );
-                        self.notify_error(message, cx);
-                    }
-                    return false;
+        doc.applied_seq = seq;
+        let current = doc.edit_gen == edit_gen;
+        let saved = match outcome {
+            SaveOutcome::Unchanged => {
+                if doc.dirty && current {
+                    doc.dirty = false;
                 }
+                true
             }
-        }
-        let saved = match files::write_atomic(&doc.path, text.as_bytes()) {
-            Ok(()) => {
+            SaveOutcome::Superseded => true,
+            SaveOutcome::Conflict => {
+                let first = !doc.conflict;
+                doc.conflict = true;
+                if first {
+                    let message = format!(
+                        "{} changed on disk; your edits are not saved. ⌘S overwrites it.",
+                        doc.path.display()
+                    );
+                    self.notify_error(message, cx);
+                }
+                false
+            }
+            SaveOutcome::Written { hash, mtime } => {
                 doc.saved_hash = hash;
-                doc.dirty = false;
+                if current {
+                    doc.dirty = false;
+                }
                 doc.conflict = false;
-                doc.mtime = mtime(&doc.path);
+                doc.mtime = mtime;
                 self.schedule_git_refresh(cx);
                 true
             }
-            Err(err) => {
-                let message = format!("Save failed for {}: {err}", doc.path.display());
+            SaveOutcome::Failed { message, touched } => {
+                if let Some(touched) = touched {
+                    doc.mtime = touched;
+                }
                 self.notify_error(message, cx);
                 false
             }
@@ -873,22 +1024,47 @@ impl Workspace {
     }
 
     fn reload_changed_documents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for doc in self.docs.iter_mut() {
-            let current = mtime(&doc.path);
-            if current.is_none() || current == doc.mtime || doc.dirty {
-                continue;
-            }
-            doc.mtime = current;
-            let Ok(text) = std::fs::read_to_string(&doc.path) else { continue };
-            let hash = hash_text(&text);
-            if hash == doc.saved_hash {
-                continue;
-            }
-            doc.saved_hash = hash;
-            doc.editor.update(cx, |state, cx| state.set_value(text, window, cx));
+        let probes: Vec<(usize, PathBuf, Option<SystemTime>, u64)> = self
+            .docs
+            .iter()
+            .filter(|doc| !doc.dirty)
+            .map(|doc| (doc.id, doc.path.clone(), doc.mtime, doc.saved_hash))
+            .collect();
+        if probes.is_empty() {
+            return;
         }
-        self.refresh_preview(window, cx);
-        cx.notify();
+        self.reload_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let changes = cx
+                .background_spawn(async move {
+                    let mut changes = Vec::new();
+                    for (id, path, known, saved_hash) in probes {
+                        let current = mtime(&path);
+                        if current.is_none() || current == known {
+                            continue;
+                        }
+                        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                        let hash = hash_text(&text);
+                        changes.push((id, current, hash, (hash != saved_hash).then_some(text)));
+                    }
+                    changes
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.reload_task = None;
+                for (id, current, hash, text) in changes {
+                    let Some(doc) = this.docs.iter_mut().find(|d| d.id == id) else { continue };
+                    if doc.dirty || doc.saving {
+                        continue;
+                    }
+                    doc.mtime = current;
+                    let Some(text) = text else { continue };
+                    doc.saved_hash = hash;
+                    doc.editor.update(cx, |state, cx| state.set_value(text, window, cx));
+                }
+                this.refresh_preview(window, cx);
+                cx.notify();
+            });
+        }));
     }
 
     pub fn format_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -987,11 +1163,22 @@ impl Workspace {
     }
 
     fn refresh_tree(&mut self, cx: &mut Context<Self>) {
-        if let Some(tree) = self.tree.as_mut() {
-            tree.refresh();
-            self.rebuild_rows();
-            cx.notify();
-        }
+        let Some(dirs) = self.tree.as_ref().map(Node::loaded_dirs) else { return };
+        self.tree_task = Some(cx.spawn(async move |this, cx| {
+            let mut listings = cx
+                .background_spawn(async move {
+                    dirs.into_iter().map(|dir| { let list = files::list_dir(&dir); (dir, list) }).collect::<std::collections::HashMap<_, _>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.tree_task = None;
+                if let Some(tree) = this.tree.as_mut() {
+                    tree.apply_listings(&mut listings);
+                    this.rebuild_rows();
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn click_row(&mut self, row: &Row, window: &mut Window, cx: &mut Context<Self>) {
@@ -2757,6 +2944,50 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         assert_eq!(external_change(&path, loaded, saved_hash), ExternalChange::None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn run_save_orders_unchanged_conflict_and_superseded() {
+        let dir = std::env::temp_dir().join(format!("forge-ws-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.txt");
+        std::fs::write(&path, "base").unwrap();
+        let gate = files::WriteGate::default();
+        let known = mtime(&path);
+        let base = hash_text("base");
+
+        assert_eq!(run_save("base", &path, known, base, true, 1, &gate), SaveOutcome::Unchanged);
+
+        let outcome = run_save("edit2", &path, known, base, true, 2, &gate);
+        assert!(matches!(outcome, SaveOutcome::Written { hash, .. } if hash == hash_text("edit2")));
+        assert_eq!(run_save("edit1", &path, known, base, false, 1, &gate), SaveOutcome::Superseded);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edit2");
+
+        let old = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        assert_eq!(run_save("edit3", &path, old, base, true, 3, &gate), SaveOutcome::Conflict);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edit2");
+        assert!(matches!(run_save("edit3", &path, old, base, false, 3, &gate), SaveOutcome::Written { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edit3");
+
+        let missing = dir.join("nope/x.txt");
+        assert!(matches!(run_save("x", &missing, None, base, false, 4, &gate), SaveOutcome::Failed { .. }));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_text_rejects_binary_and_non_utf8() {
+        let dir = std::env::temp_dir().join(format!("forge-ws-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("a.rs");
+        std::fs::write(&ok, "fn main() {}\n").unwrap();
+        let loaded = load_text(&ok).unwrap();
+        assert_eq!(loaded.saved_hash, hash_text(&loaded.text));
+        assert_eq!(loaded.language, "rust");
+        let bin = dir.join("b.bin");
+        std::fs::write(&bin, [0u8, 1, 2, 0, 255]).unwrap();
+        assert!(load_text(&bin).is_err());
+        assert!(load_text(&dir.join("missing")).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
