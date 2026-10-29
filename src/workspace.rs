@@ -104,6 +104,8 @@ pub struct Workspace {
     git_status: HashMap<PathBuf, FileStatus>,
     git_busy: bool,
     git_task: Option<Task<()>>,
+    /// Selected row in the Changes navigator: (staged section, repo-relative path).
+    selected_change: Option<(bool, PathBuf)>,
     commit_input: Entity<InputState>,
     clone_input: Entity<InputState>,
     clone_open: bool,
@@ -222,6 +224,7 @@ impl Workspace {
             git_status: HashMap::new(),
             git_busy: false,
             git_task: None,
+            selected_change: None,
             commit_input,
             clone_input,
             clone_open: false,
@@ -671,10 +674,9 @@ impl Workspace {
         self.git_task = Some(cx.spawn(async move |this, cx| {
             let state = task.await;
             let _ = this.update(cx, |this, cx| {
-                if let (Some(root), Some(state)) = (this.root.as_ref(), state.as_ref()) {
-                    this.git_status = state.status_map(root);
-                } else {
-                    this.git_status.clear();
+                match state.as_ref() {
+                    Some(state) => this.git_status = state.status_map(),
+                    None => this.git_status.clear(),
                 }
                 this.repo = state;
                 cx.notify();
@@ -721,7 +723,34 @@ impl Workspace {
             return;
         }
         self.commit_input.update(cx, |input, cx| input.set_value("", window, cx));
-        self.run_git("Commit", move |root| git::commit_all(root, &message), window, cx);
+        // Commits the staged files; with nothing staged it commits everything.
+        self.run_git("Commit", move |root| git::commit(root, &message, true), window, cx);
+    }
+
+    /// Quick index edits (stage/unstage). Unlike `run_git` these don't post a
+    /// "finished" notice; the refreshed lists are the feedback.
+    fn run_index_op(
+        &mut self,
+        op: impl FnOnce(&Path) -> anyhow::Result<()> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.root.clone() else { return };
+        if self.git_busy {
+            return;
+        }
+        // Stage what the editor shows, not a stale on-disk version.
+        self.save_all(cx);
+        let task = cx.background_spawn(async move { op(&root) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(err) = result {
+                    this.notify_error(format!("Git failed: {err}"), cx);
+                }
+                this.refresh_git(cx);
+            });
+        })
+        .detach();
     }
 
     // ---- Clone -----------------------------------------------------------
@@ -1007,6 +1036,36 @@ fn section_header(title: impl Into<SharedString>) -> impl IntoElement {
         .child(title.into())
 }
 
+/// Section header with a right-aligned text action ("Stage All" / "Unstage All").
+fn change_section_header(
+    id: &'static str,
+    title: String,
+    action: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .px(px(12.))
+        .pt(px(12.))
+        .pb(px(6.))
+        .flex()
+        .items_center()
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(Palette::muted())
+        .child(div().flex_1().child(title))
+        .child(
+            div()
+                .id(id)
+                .px(px(6.))
+                .rounded(px(4.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .hover(|s| s.bg(ca(0xffffff, 0.08)).text_color(Palette::text()))
+                .child(action)
+                .on_click(on_click),
+        )
+}
+
 fn status_color(status: FileStatus) -> Hsla {
     match status {
         FileStatus::Modified | FileStatus::Renamed => Palette::git_modified(),
@@ -1123,7 +1182,7 @@ impl Workspace {
     }
 
     fn render_navigator(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let change_count = self.repo.as_ref().map_or(0, |r| r.changes.len());
+        let change_count = self.repo.as_ref().map_or(0, |r| r.file_count());
         let tab = |id: &'static str, name: IconName, nav: Navigator, cx: &mut Context<Self>| -> AnyElement {
             let active = self.navigator == nav;
             tool_button(id, name, active, cx.listener(move |this, _, _, cx| {
@@ -1289,7 +1348,8 @@ impl Workspace {
                 .child(if self.root.is_some() { "Not a git repository" } else { "No folder open" })
                 .into_any_element();
         };
-        let root = self.root.clone().unwrap_or_default();
+        let workdir = repo.workdir.clone();
+        let commit_label = if repo.staged.is_empty() { "Commit All" } else { "Commit" };
         div()
             .flex_1()
             .flex()
@@ -1308,7 +1368,7 @@ impl Workspace {
                         div()
                             .flex()
                             .gap(px(6.))
-                            .child(text_button("commit", "Commit All", true, cx.listener(
+                            .child(text_button("commit", commit_label, true, cx.listener(
                                 |this, _, window, cx| this.commit(window, cx),
                             )))
                             .child(div().flex_1())
@@ -1331,77 +1391,145 @@ impl Workspace {
                         )
                     }),
             )
-            .child(section_header(format!("CHANGES ({})", repo.changes.len())))
             .child(
                 div()
                     .id("changes")
                     .flex_1()
                     .overflow_y_scroll()
-                    .children(repo.changes.iter().enumerate().map(|(ix, change)| {
-                        let path = root.join(&change.path);
-                        let name = change
-                            .path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let dir = change.path.parent().map(|p| p.display().to_string()).unwrap_or_default();
-                        let change_for_discard = change.clone();
-                        div()
-                            .id(("change", ix))
-                            .group("change")
-                            .h(px(ROW_HEIGHT))
-                            .mx(px(6.))
-                            .px(px(8.))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .rounded(px(5.))
-                            .text_size(px(12.5))
-                            .hover(|s| s.bg(Palette::row_hover()))
-                            .child(
-                                div()
-                                    .w(px(12.))
-                                    .text_size(px(10.5))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(status_color(change.status))
-                                    .child(change.status.letter()),
-                            )
-                            .child(div().text_color(Palette::text()).whitespace_nowrap().child(name))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_size(px(11.))
-                                    .text_color(Palette::faint())
-                                    .child(dir),
-                            )
-                            .child(
-                                div()
-                                    .id(("discard", ix))
-                                    .invisible()
-                                    .group_hover("change", |s| s.visible())
-                                    .child(icon(IconName::Undo2, 12., Palette::muted()))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        let change = change_for_discard.clone();
-                                        this.run_git(
-                                            "Discard",
-                                            move |root| git::discard(root, &change).map(|_| String::new()),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if path.is_file() {
-                                    this.open_file(&path, window, cx);
-                                }
-                            }))
-                    })),
+                    .when(!repo.staged.is_empty(), |el| {
+                        el.child(change_section_header(
+                            "staged-header",
+                            format!("STAGED ({})", repo.staged.len()),
+                            "Unstage All",
+                            cx.listener(|this, _, _, cx| this.run_index_op(git::unstage_all, cx)),
+                        ))
+                        .children(
+                            repo.staged
+                                .iter()
+                                .enumerate()
+                                .map(|(ix, change)| self.render_change_row(ix, change, &workdir, cx)),
+                        )
+                    })
+                    .child(change_section_header(
+                        "changes-header",
+                        format!("CHANGES ({})", repo.unstaged.len()),
+                        "Stage All",
+                        cx.listener(|this, _, _, cx| this.run_index_op(git::stage_all, cx)),
+                    ))
+                    .children(
+                        repo.unstaged
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, change)| self.render_change_row(ix, change, &workdir, cx)),
+                    ),
             )
             .into_any_element()
+    }
+
+    /// One file row. Staged rows offer "−" (unstage); unstaged rows offer
+    /// discard and "+" (stage). Buttons show on hover and on the selected row.
+    fn render_change_row(&self, ix: usize, change: &git::Change, workdir: &Path, cx: &mut Context<Self>) -> AnyElement {
+        let staged = change.staged;
+        let selected = self
+            .selected_change
+            .as_ref()
+            .is_some_and(|(s, path)| *s == staged && *path == change.path);
+        let name = change.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let dir = change.path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+        let absolute = workdir.join(&change.path);
+        let rel = change.path.clone();
+        let group: SharedString = if staged { "staged-row".into() } else { "change-row".into() };
+        let row_id = if staged { ("staged", ix) } else { ("change", ix) };
+
+        let action_button = |id: (&'static str, usize), icon_name: IconName| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(18.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|s| s.bg(ca(0xffffff, 0.12)))
+                .when(!selected, |el| el.invisible().group_hover(group.clone(), |s| s.visible()))
+                .child(icon(icon_name, 12., Palette::muted()))
+        };
+
+        let mut row = div()
+            .id(row_id)
+            .group(group.clone())
+            .h(px(ROW_HEIGHT))
+            .mx(px(6.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(5.))
+            .text_size(px(12.5))
+            .when(selected, |el| el.bg(Palette::row_selected()))
+            .when(!selected, |el| el.hover(|s| s.bg(Palette::row_hover())))
+            .child(
+                div()
+                    .w(px(12.))
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(status_color(change.status))
+                    .child(change.status.letter()),
+            )
+            .child(div().text_color(Palette::text()).whitespace_nowrap().child(name))
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(11.))
+                    .text_color(Palette::faint())
+                    .child(dir),
+            );
+
+        if staged {
+            let rel = rel.clone();
+            row = row.child(action_button(("unstage", ix), IconName::Minus).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    let path = rel.clone();
+                    this.run_index_op(move |root| git::unstage_file(root, &path), cx);
+                },
+            )));
+        } else {
+            let change_for_discard = change.clone();
+            let rel = rel.clone();
+            row = row
+                .child(action_button(("discard", ix), IconName::Undo2).on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        let change = change_for_discard.clone();
+                        this.run_git(
+                            "Discard",
+                            move |root| git::discard(root, &change).map(|_| String::new()),
+                            window,
+                            cx,
+                        );
+                    },
+                )))
+                .child(action_button(("stage", ix), IconName::Plus).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        let path = rel.clone();
+                        this.run_index_op(move |root| git::stage_file(root, &path), cx);
+                    },
+                )));
+        }
+
+        row.on_click(cx.listener(move |this, _, window, cx| {
+            this.selected_change = Some((staged, rel.clone()));
+            cx.notify();
+            if absolute.is_file() {
+                this.open_file(&absolute, window, cx);
+            }
+        }))
+        .into_any_element()
     }
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
