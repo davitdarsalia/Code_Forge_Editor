@@ -255,7 +255,10 @@ mod tests {
     use super::*;
 
     fn fixture() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("forge-search-{}", std::process::id()));
+        // Unique per call: tests run in parallel and each deletes its fixture.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("forge-search-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("ignored")).unwrap();
