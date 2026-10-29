@@ -122,6 +122,35 @@ pub fn fuzzy(index: &FileIndex, query: &str, limit: usize) -> Vec<FuzzyHit> {
         .collect()
 }
 
+/// Fuzzy-ranks arbitrary labels (commands, symbols); `ix` points into `items`.
+/// An empty query keeps the original order.
+pub fn fuzzy_list<'a>(items: impl IntoIterator<Item = &'a str>, query: &str, limit: usize) -> Vec<FuzzyHit> {
+    let items: Vec<&str> = items.into_iter().collect();
+    if query.trim().is_empty() {
+        return (0..items.len().min(limit)).map(|ix| FuzzyHit { ix, indices: Vec::new() }).collect();
+    }
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut buf = Vec::new();
+    let mut scored: Vec<(u32, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, item)| Some((pattern.score(Utf32Str::new(item, &mut buf), &mut matcher)?, ix)))
+        .collect();
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.truncate(limit);
+    scored
+        .into_iter()
+        .map(|(_, ix)| {
+            let mut indices = Vec::new();
+            pattern.indices(Utf32Str::new(items[ix], &mut buf), &mut matcher, &mut indices);
+            indices.sort_unstable();
+            indices.dedup();
+            FuzzyHit { ix, indices }
+        })
+        .collect()
+}
+
 // ---- Full-text search -------------------------------------------------------
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -293,6 +322,15 @@ mod tests {
         let index = build_index(&dir);
         let hits = fuzzy(&index, "main", 10);
         assert_eq!(index.files[hits[0].ix], "src/main.rs");
+    }
+
+    #[test]
+    fn fuzzy_list_filters_labels() {
+        let items = ["Toggle Terminal", "Save All", "Toggle Navigator"];
+        let hits = fuzzy_list(items, "tnav", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].ix, 2);
+        assert_eq!(fuzzy_list(items, "", 2).len(), 2);
     }
 }
 

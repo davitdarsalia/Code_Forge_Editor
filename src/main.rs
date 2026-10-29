@@ -1,5 +1,6 @@
 extern crate gpui_kit as gpui;
 
+mod commands;
 mod files;
 mod git;
 mod languages;
@@ -8,6 +9,7 @@ mod quick_open;
 mod recent;
 mod search;
 mod search_panel;
+mod symbols;
 mod terminal;
 mod theme;
 mod workspace;
@@ -42,6 +44,7 @@ actions!(
         NewFile,
         QuickOpenFile,
         FindInProject,
+        CommitChanges,
     ]
 );
 
@@ -231,6 +234,9 @@ fn register_actions(cx: &mut App) {
     });
     cx.on_action(|_: &FindInProject, cx| {
         with_workspace(cx, |ws, window, cx| ws.show_search(window, cx))
+    });
+    cx.on_action(|_: &CommitChanges, cx| {
+        with_workspace(cx, |ws, window, cx| ws.show_commit(window, cx))
     });
 
     cx.bind_keys([
