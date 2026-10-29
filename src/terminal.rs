@@ -17,8 +17,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use crate::theme::{MONO_FONT, Palette, c};
 
-const FONT_SIZE: f32 = 12.5;
-const LINE_HEIGHT: f32 = 17.;
+/// Row height relative to the font size (12.5 pt → 17 px, as before).
+const LINE_HEIGHT_RATIO: f32 = 1.36;
 const SCROLLBACK: usize = 5_000;
 const PADDING: f32 = 8.;
 
@@ -34,6 +34,8 @@ pub struct Terminal {
     focus: FocusHandle,
     size: (u16, u16),
     cell_width: Option<Pixels>,
+    /// Font size the cached cell width and row height belong to.
+    font_size: f32,
     scroll_remainder: f32,
     exited: bool,
     _pump: Option<Task<()>>,
@@ -53,6 +55,7 @@ impl Terminal {
             focus: cx.focus_handle(),
             size,
             cell_width: None,
+            font_size: crate::settings::Settings::get(cx).terminal_font_size,
             scroll_remainder: 0.,
             exited: false,
             _pump: None,
@@ -151,7 +154,7 @@ impl Terminal {
         let width = (bounds.size.width - px(PADDING * 2.)).max(px(0.));
         let height = (bounds.size.height - px(PADDING * 2.)).max(px(0.));
         let cols = ((width / cell_width).floor() as u16).max(10);
-        let rows = ((height / px(LINE_HEIGHT)).floor() as u16).max(2);
+        let rows = ((height / px(self.line_height())).floor() as u16).max(2);
         if (rows, cols) == self.size {
             return;
         }
@@ -201,6 +204,10 @@ impl Terminal {
         }
     }
 
+    fn line_height(&self) -> f32 {
+        (self.font_size * LINE_HEIGHT_RATIO).round()
+    }
+
     fn paste(&mut self, text: &str) {
         let bracketed = self.parser.lock().unwrap().screen().bracketed_paste();
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
@@ -214,8 +221,8 @@ impl Terminal {
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let delta = event.delta.pixel_delta(px(LINE_HEIGHT)).y;
-        self.scroll_remainder += f32::from(delta) / LINE_HEIGHT;
+        let delta = event.delta.pixel_delta(px(self.line_height())).y;
+        self.scroll_remainder += f32::from(delta) / self.line_height();
         let lines = self.scroll_remainder.trunc() as i64;
         if lines == 0 {
             return;
@@ -236,16 +243,23 @@ impl Terminal {
         cx.notify();
     }
 
-    fn cell_width(&mut self, window: &mut Window) -> Pixels {
+    fn cell_width(&mut self, window: &mut Window, cx: &App) -> Pixels {
+        let font_size = crate::settings::Settings::get(cx).terminal_font_size;
+        if font_size != self.font_size {
+            // Font changed in Settings: re-measure and re-fit rows/cols.
+            self.font_size = font_size;
+            self.cell_width = None;
+            self.size = (0, 0);
+        }
         if let Some(width) = self.cell_width {
             return width;
         }
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&mono_font());
         let width = text_system
-            .advance(font_id, px(FONT_SIZE), 'm')
+            .advance(font_id, px(self.font_size), 'm')
             .map(|size| size.width)
-            .unwrap_or(px(FONT_SIZE * 0.6));
+            .unwrap_or(px(self.font_size * 0.6));
         self.cell_width = Some(width);
         width
     }
@@ -304,7 +318,8 @@ impl Focusable for Terminal {
 
 impl Render for Terminal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let cell_width = self.cell_width(window);
+        let cell_width = self.cell_width(window, cx);
+        let line_height = self.line_height();
         let focused = self.focus.is_focused(window);
         let rows = self.render_rows(focused);
         let this = cx.entity();
@@ -319,8 +334,8 @@ impl Render for Terminal {
             .bg(Palette::panel_bg())
             .p(px(PADDING))
             .font_family(MONO_FONT)
-            .text_size(px(FONT_SIZE))
-            .line_height(px(LINE_HEIGHT))
+            .text_size(px(self.font_size))
+            .line_height(px(line_height))
             .text_color(Palette::text())
             .cursor_text()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
@@ -338,7 +353,7 @@ impl Render for Terminal {
                 .absolute()
                 .size_full(),
             )
-            .children(rows.into_iter().map(|row| div().h(px(LINE_HEIGHT)).whitespace_nowrap().child(row)))
+            .children(rows.into_iter().map(|row| div().h(px(line_height)).whitespace_nowrap().child(row)))
             .when(self.exited, |el| {
                 el.child(
                     div()

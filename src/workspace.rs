@@ -16,7 +16,7 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, MouseButton, MouseMoveEvent, Context, Entity, ExternalPaths, FocusHandle,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    canvas, div, prelude::FluentBuilder as _, px, uniform_list,
+    ScrollStrategy, UniformListScrollHandle, canvas, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 
 use crate::file_icons;
@@ -28,13 +28,12 @@ use crate::preview::{self, Preview};
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::recent;
 use crate::search::FileIndex;
+use crate::settings::Settings;
 use crate::search_panel::{SearchEvent, SearchPanel};
 use crate::terminal::Terminal;
 use gpui_kit::Focusable as _;
 use crate::theme::{Palette, ca};
 
-/// How long after the last keystroke a file is written to disk.
-pub const AUTOSAVE_DELAY: Duration = Duration::from_millis(200);
 const GIT_REFRESH_DELAY: Duration = Duration::from_millis(600);
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const TOOLBAR_HEIGHT: f32 = 38.;
@@ -123,6 +122,9 @@ pub struct Workspace {
     preview_width: f32,
     drag: Option<Drag>,
     focus: FocusHandle,
+    tree_scroll: UniformListScrollHandle,
+    /// Soft-wrap value last pushed to the open editors (see `sync_settings`).
+    soft_wrap: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -208,7 +210,7 @@ impl Workspace {
             next_doc_id: 0,
             navigator: Navigator::Files,
             show_left: true,
-            show_right: true,
+            show_right: Settings::get(cx).show_inspector,
             show_terminal: true,
             terminal: None,
             bottom_tab: BottomTab::Terminal,
@@ -238,6 +240,8 @@ impl Workspace {
             preview_width: 420.,
             drag: None,
             focus: cx.focus_handle(),
+            tree_scroll: UniformListScrollHandle::new(),
+            soft_wrap: Settings::get(cx).soft_wrap,
             _subscriptions: subscriptions,
         }
     }
@@ -395,7 +399,7 @@ impl Workspace {
                 .language(language)
                 .line_number(true)
                 .folding(true)
-                .soft_wrap(false)
+                .soft_wrap(self.soft_wrap)
                 .default_value(text)
         });
         let id = self.next_doc_id;
@@ -454,11 +458,12 @@ impl Workspace {
     // ---- Autosave --------------------------------------------------------
 
     fn schedule_save(&mut self, id: usize, cx: &mut Context<Self>) {
+        let delay = Settings::get(cx).autosave_delay();
         let Some(doc) = self.docs.iter_mut().find(|d| d.id == id) else { return };
         doc.dirty = true;
         // Replacing the task drops (cancels) the previous timer: a debounce.
         doc.save_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(AUTOSAVE_DELAY).await;
+            cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |this, cx| this.save_doc(id, cx));
         }));
         cx.notify();
@@ -799,7 +804,7 @@ impl Workspace {
         self.terminal = Some(cx.new(|cx| Terminal::new(&cwd, window, cx)));
     }
 
-    fn restart_terminal(&mut self, cx: &mut Context<Self>) {
+    pub fn restart_terminal(&mut self, cx: &mut Context<Self>) {
         let cwd = self.root.clone().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("/"));
         if let Some(terminal) = self.terminal.as_ref() {
             terminal.update(cx, |terminal, cx| terminal.restart(&cwd, cx));
@@ -819,6 +824,89 @@ impl Workspace {
 
     pub fn stop_build(&mut self, cx: &mut Context<Self>) {
         self.build.update(cx, |build, cx| build.stop(cx));
+    }
+
+    // ---- Shortcut targets ------------------------------------------------
+
+    /// Shows the terminal (starting it if needed) and moves focus into it.
+    pub fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_terminal = true;
+        self.ensure_terminal(window, cx);
+        if let Some(terminal) = self.terminal.as_ref() {
+            let focus = terminal.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// Restarts the shell in the project root, showing and focusing it.
+    pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let existed = self.terminal.is_some();
+        self.focus_terminal(window, cx);
+        if existed {
+            self.restart_terminal(cx);
+        }
+    }
+
+    /// Switches the navigator tab (⌘1/⌘2/⌘3), opening the navigator.
+    pub fn show_navigator(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let nav = match tab {
+            0 => Navigator::Files,
+            1 => Navigator::Search,
+            _ => Navigator::Changes,
+        };
+        if nav == Navigator::Search {
+            self.show_search(window, cx);
+            return;
+        }
+        self.show_left = true;
+        self.navigator = nav;
+        cx.notify();
+    }
+
+    /// Expands the tree down to the active file and scrolls it into view.
+    pub fn reveal_active(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.active.and_then(|ix| self.docs.get(ix)).map(|d| d.path.clone()) else { return };
+        let Some(tree) = self.tree.as_mut() else { return };
+        tree.reveal(&path);
+        self.rebuild_rows();
+        self.show_left = true;
+        self.navigator = Navigator::Files;
+        if let Some(ix) = self.rows.iter().position(|row| row.path == path) {
+            self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
+    /// Opens the Changes tab and puts the cursor in the commit message box.
+    pub fn focus_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.root.is_none() {
+            return;
+        }
+        self.show_left = true;
+        self.navigator = Navigator::Changes;
+        self.commit_input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Cycles editor tabs; `forward` = ⌘⇧], otherwise ⌘⇧[.
+    pub fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.docs.len();
+        let Some(ix) = self.active.filter(|_| count > 1) else { return };
+        let next = if forward { (ix + 1) % count } else { (ix + count - 1) % count };
+        self.activate(next, window, cx);
+    }
+
+    /// Pushes settings that live in editor state (not read at render time).
+    fn sync_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let soft_wrap = Settings::get(cx).soft_wrap;
+        if soft_wrap == self.soft_wrap {
+            return;
+        }
+        self.soft_wrap = soft_wrap;
+        for doc in &self.docs {
+            doc.editor.update(cx, |state, cx| state.set_soft_wrap(soft_wrap, window, cx));
+        }
     }
 
     // ---- Notices ---------------------------------------------------------
@@ -1100,6 +1188,7 @@ impl Workspace {
         let rows = self.rows.clone();
         let active_path = self.active.and_then(|ix| self.docs.get(ix)).map(|d| d.path.clone());
         let statuses = self.git_status.clone();
+        let scroll = self.tree_scroll.clone();
         uniform_list("file-tree", rows.len(), cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
             range
                 .map(|ix| {
@@ -1117,6 +1206,7 @@ impl Workspace {
                 })
                 .collect::<Vec<_>>()
         }))
+        .track_scroll(&scroll)
         .flex_1()
         .py(px(4.))
         .into_any_element()
@@ -1382,7 +1472,13 @@ impl Workspace {
                         .flex_1()
                         .min_w(px(0.))
                         .h_full()
-                        .child(Editor::new(&doc.editor).bordered(false).appearance(false).h_full()),
+                        .child(
+                            Editor::new(&doc.editor)
+                                .bordered(false)
+                                .appearance(false)
+                                .text_size(px(Settings::get(cx).editor_font_size))
+                                .h_full(),
+                        ),
                 )
                 .when(self.preview_open(), |el| {
                     el.child(drag_handle("handle-preview", Drag::Preview, cx))
@@ -1897,6 +1993,7 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_settings(window, cx);
         let preview_live = self.preview_open()
             && !self.quick_open_visible
             && !self.clone_open
