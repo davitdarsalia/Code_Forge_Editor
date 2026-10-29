@@ -212,7 +212,7 @@ impl SearchPanel {
         let base = div()
             .id(("search-row", ix))
             .w_full()
-            .h(px(ROW_HEIGHT))
+            .h(px(crate::icons::row_height(ROW_HEIGHT, crate::file_icons::ICON_SIZE)))
             .px(px(6.))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.click(row, cx)));
@@ -237,7 +237,7 @@ impl SearchPanel {
                         .pl(px(4.))
                         .child(
                             Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
-                                .size(px(11.))
+                                .size(crate::icons::scaled(11.))
                                 .text_color(Palette::faint()),
                         )
                         .child(file_icons::file_icon_img(Path::new(&name)))

@@ -7,6 +7,7 @@ mod build_panel;
 mod files;
 mod format;
 mod git;
+mod icons;
 mod index_cache;
 mod languages;
 mod preview;
@@ -232,7 +233,7 @@ fn open_settings(cx: &mut App) {
             return;
         }
     }
-    let bounds = Bounds::centered(None, size(px(440.), px(400.)), cx);
+    let bounds = Bounds::centered(None, size(px(460.), px(600.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         is_resizable: false,
@@ -482,7 +483,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         // Global (no context): nothing in the editor's "Input" context binds
         // cmd-i, so this reaches the app handler from inside the editor too.
         KeyBinding::new("cmd-i", FormatFile, None),
-        KeyBinding::new("cmd-b", Build, None),
+        KeyBinding::new("cmd-shift-b", Build, None),
         KeyBinding::new("cmd-shift-k", CleanBuild, None),
         KeyBinding::new("cmd-shift-i", InstallBuild, None),
         KeyBinding::new("cmd-.", StopBuild, None),
@@ -505,17 +506,21 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-[", PreviousTab, None),
         KeyBinding::new("cmd-{", PreviousTab, None),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+        KeyBinding::new("cmd-b", ToggleNavigator, None),
         KeyBinding::new("cmd-0", ToggleNavigator, None),
         KeyBinding::new("cmd-1", ShowFilesNavigator, None),
         KeyBinding::new("cmd-2", ShowSearchNavigator, None),
         KeyBinding::new("cmd-3", ShowChangesNavigator, None),
         KeyBinding::new("cmd-shift-j", RevealInNavigator, None),
+        KeyBinding::new("cmd-r", ToggleInspector, None),
         KeyBinding::new("cmd-alt-0", ToggleInspector, None),
+        KeyBinding::new("cmd-j", ToggleTerminal, None),
         KeyBinding::new("cmd-shift-y", ToggleTerminal, None),
         KeyBinding::new("ctrl-`", FocusTerminal, None),
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
         KeyBinding::new("ctrl-~", NewTerminal, None),
         KeyBinding::new("cmd-alt-enter", TogglePreview, None),
+        KeyBinding::new("cmd-g", FocusCommit, None),
         KeyBinding::new("cmd-alt-c", FocusCommit, None),
         KeyBinding::new("cmd-alt-x", GitPull, None),
         KeyBinding::new("cmd-alt-p", GitPush, None),
@@ -550,7 +555,9 @@ fn main() {
         startup::mark("app.run callback");
         gpui_kit::init(cx);
         startup::mark("gpui_kit::init");
-        cx.set_global(settings::load());
+        let loaded = settings::load();
+        loaded.apply_statics();
+        cx.set_global(loaded);
         languages::register();
         startup::mark("settings + languages");
         theme::apply(cx);

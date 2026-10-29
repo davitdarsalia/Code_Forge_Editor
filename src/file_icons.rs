@@ -9,10 +9,11 @@
 
 use std::path::Path;
 
-use gpui_kit::{Img, Styled as _, img, px};
+use gpui_kit::{Img, Styled as _, img};
 
-/// Icon edge in points. The SVGs are authored at 14x14 so the 2x raster is
-/// exactly 28 device pixels.
+/// Icon edge in points at 100% (Settings ▸ Icon size scales it). The SVGs
+/// declare 32x32 so GPUI's 2x raster is 64 px: every scale up to 200% is
+/// drawn by downsampling, which stays sharp.
 pub const ICON_SIZE: f32 = 14.;
 
 macro_rules! icons {
@@ -45,7 +46,7 @@ pub fn folder_icon_img(path: &Path, expanded: bool) -> Img {
 }
 
 fn sized(asset: &'static str) -> Img {
-    img(asset).size(px(ICON_SIZE)).flex_none()
+    img(asset).size(crate::icons::scaled(ICON_SIZE)).flex_none()
 }
 
 /// Asset path of the icon for a file. Exact names win over extensions.

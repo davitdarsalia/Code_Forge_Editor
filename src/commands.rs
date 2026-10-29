@@ -37,10 +37,10 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "Show Files Navigator", keys: "⌘1", action: || Box::new(ShowFilesNavigator) },
     Command { name: "Show Search Navigator", keys: "⌘2", action: || Box::new(ShowSearchNavigator) },
     Command { name: "Show Changes Navigator", keys: "⌘3", action: || Box::new(ShowChangesNavigator) },
-    Command { name: "Toggle Navigator", keys: "⌘0", action: || Box::new(ToggleNavigator) },
-    Command { name: "Toggle Inspector", keys: "⌥⌘0", action: || Box::new(ToggleInspector) },
+    Command { name: "Toggle Navigator", keys: "⌘B", action: || Box::new(ToggleNavigator) },
+    Command { name: "Toggle Inspector", keys: "⌘R", action: || Box::new(ToggleInspector) },
     Command { name: "Toggle Canvas", keys: "⌥⌘↩", action: || Box::new(TogglePreview) },
-    Command { name: "Toggle Terminal", keys: "⇧⌘Y", action: || Box::new(ToggleTerminal) },
+    Command { name: "Toggle Terminal", keys: "⌘J", action: || Box::new(ToggleTerminal) },
     Command { name: "Focus Terminal", keys: "⌃`", action: || Box::new(FocusTerminal) },
     Command { name: "New Terminal", keys: "⌃⇧`", action: || Box::new(NewTerminal) },
     // Find / Navigate
@@ -49,12 +49,12 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "Show Next Tab", keys: "⇧⌘]", action: || Box::new(NextTab) },
     Command { name: "Show Previous Tab", keys: "⇧⌘[", action: || Box::new(PreviousTab) },
     // Source Control
-    Command { name: "Commit…", keys: "⌥⌘C", action: || Box::new(FocusCommit) },
+    Command { name: "Commit…", keys: "⌘G", action: || Box::new(FocusCommit) },
     Command { name: "Pull", keys: "⌥⌘X", action: || Box::new(GitPull) },
     Command { name: "Push", keys: "⌥⌘P", action: || Box::new(GitPush) },
     Command { name: "Fetch", keys: "⌥⌘F", action: || Box::new(GitFetch) },
     // Product
-    Command { name: "Build", keys: "⌘B", action: || Box::new(Build) },
+    Command { name: "Build", keys: "⇧⌘B", action: || Box::new(Build) },
     Command { name: "Install (Gradle)", keys: "⇧⌘I", action: || Box::new(InstallBuild) },
     Command { name: "Clean Build Folder", keys: "⇧⌘K", action: || Box::new(CleanBuild) },
     Command { name: "Stop", keys: "⌘.", action: || Box::new(StopBuild) },

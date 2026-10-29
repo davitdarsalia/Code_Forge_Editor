@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::{
+    MouseButton,
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FontWeight, Hsla, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task,
     UniformListScrollHandle, Window, anchored, deferred, div, prelude::FluentBuilder as _, px, uniform_list,
@@ -456,7 +457,7 @@ fn preferred_unit(project: &BuildProject) -> Option<String> {
 // ---- Rendering --------------------------------------------------------------
 
 fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
-    Icon::new(name).size(px(size)).text_color(color)
+    crate::icons::ui_icon(name, size, color)
 }
 
 fn segment_button(
@@ -495,7 +496,9 @@ pub fn toolbar_segment(build: &Entity<BuildPanel>, cx: &App) -> AnyElement {
         .items_center()
         .gap(px(2.))
         .mr(px(8.))
-        // Same path as ⌘B / ⌘. so the toolbar also saves open files first.
+        // Keep clicks off the toolbar, whose double-click zooms the window.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        // Same path as ⇧⌘B / ⌘. so the toolbar also saves open files first.
         .child(segment_button("build-run", IconName::Play, has_target, |window, cx| {
             window.dispatch_action(Box::new(crate::Build), cx)
         }))
@@ -528,7 +531,11 @@ pub fn toolbar_segment(build: &Entity<BuildPanel>, cx: &App) -> AnyElement {
                 )
                 .when(open, |el| {
                     el.child(div().absolute().top(px(28.)).left_0().child(deferred(
-                        anchored().snap_to_window_with_margin(px(8.)).child(render_picker(build, cx)),
+                        anchored().snap_to_window_with_margin(px(8.)).child(
+                            div()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(render_picker(build, cx)),
+                        ),
                     )))
                 }),
         )
@@ -672,7 +679,7 @@ impl BuildPanel {
                     Some(
                         div()
                             .id(("build-issue", ix))
-                            .h(px(ISSUE_ROW_HEIGHT))
+                            .h(px(crate::icons::row_height(ISSUE_ROW_HEIGHT, crate::file_icons::ICON_SIZE)))
                             .px(px(10.))
                             .flex()
                             .items_center()

@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::Icon;
 use gpui_kit::component::input::{
     EditorState, Escape, IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline,
 };
@@ -454,7 +453,7 @@ impl Render for QuickOpen {
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(Palette::border())
-                    .child(Icon::new(IconName::Search).size(px(16.)).text_color(Palette::muted()))
+                    .child(crate::icons::ui_icon(IconName::Search, 16., Palette::muted()))
                     .child(div().flex_1().child(Input::new(&self.input).appearance(false))),
             )
             .child(
@@ -662,7 +661,7 @@ impl QuickOpen {
                 let command = &COMMANDS[hit.ix];
                 self.row(row, cx)
                     .h(px(30.))
-                    .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(Palette::muted()))
+                    .child(crate::icons::ui_icon(IconName::ChevronRight, 14., Palette::muted()))
                     .child(
                         div()
                             .flex_1()

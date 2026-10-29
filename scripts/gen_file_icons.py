@@ -2,8 +2,9 @@
 """Generates the full-color file-tree icons in assets/file-icons/.
 
 Each icon is a standalone 16x16-viewBox SVG. They are drawn with
-width/height 14 so GPUI's 2x SVG rasterizer produces exactly 28 device
-pixels: pixel-perfect at the 14px size used by the tree, tabs and lists.
+width/height 32 so GPUI's 2x SVG rasterizer produces a 64 px image that is
+only ever downsampled (sharp at every Settings ▸ Icon size up to 200%).
+Run scripts/minify-icons.sh afterwards to shrink the output with svgo.
 No <text>: monograms are stroked paths, so no font lookup at render time.
 
 Run: python3 scripts/gen_file_icons.py
@@ -18,7 +19,7 @@ OUT = Path(__file__).resolve().parent.parent / "assets" / "file-icons"
 def svg(body, defs=""):
     d = f"<defs>{defs}</defs>" if defs else ""
     return (
-        '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16">'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 16 16">'
         f"{d}{body}</svg>\n"
     )
 

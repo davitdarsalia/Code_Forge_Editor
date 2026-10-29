@@ -4,7 +4,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use std::path::Path as StdPath;
+
+use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, Global, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
@@ -26,6 +30,8 @@ pub struct Settings {
     pub show_inspector: bool,
     pub open_last_project: bool,
     pub launch_full_screen: bool,
+    /// Every icon in the app, 1.0 = 100%.
+    pub icon_scale: f32,
 }
 
 impl Default for Settings {
@@ -38,6 +44,7 @@ impl Default for Settings {
             show_inspector: true,
             open_last_project: true,
             launch_full_screen: true,
+            icon_scale: crate::icons::DEFAULT_SCALE,
         }
     }
 }
@@ -66,7 +73,14 @@ impl Settings {
         ] {
             *value = if value.is_finite() { value.clamp(FONT_RANGE.0, FONT_RANGE.1) } else { default };
         }
+        let (lo, hi) = crate::icons::SCALE_RANGE;
+        self.icon_scale = if self.icon_scale.is_finite() { self.icon_scale.clamp(lo, hi) } else { defaults.icon_scale };
         self
+    }
+
+    /// Mirrors settings that render code reads without the global.
+    pub fn apply_statics(&self) {
+        crate::icons::set_scale(self.icon_scale);
     }
 
     pub fn from_json(bytes: &[u8]) -> Settings {
@@ -148,6 +162,7 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
         })
         .detach();
     }
+    settings.apply_statics();
     cx.set_global(settings);
     cx.refresh_windows();
 }
@@ -158,6 +173,7 @@ pub struct SettingsView {
     autosave: Entity<InputState>,
     editor_font: Entity<InputState>,
     terminal_font: Entity<InputState>,
+    icon_size: Entity<SliderState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -171,8 +187,23 @@ impl SettingsView {
         let editor_font = field(format_size(current.editor_font_size), window, cx);
         let terminal_font = field(format_size(current.terminal_font_size), window, cx);
 
+        let (lo, hi) = crate::icons::SCALE_RANGE;
+        let icon_size = cx.new(|_| {
+            SliderState::new()
+                .min(lo * 100.)
+                .max(hi * 100.)
+                .step(5.)
+                .default_value(current.icon_scale * 100.)
+        });
+
         // Values apply as soon as they parse; out-of-range input is clamped on save.
         let subscriptions = vec![
+            // Live while dragging: every icon in every window resizes with it.
+            cx.subscribe(&icon_size, |_, _, event: &SliderEvent, cx| {
+                let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
+                let percent = value.start();
+                update(cx, |s| s.icon_scale = percent / 100.);
+            }),
             cx.subscribe(&autosave, |_, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     if let Ok(ms) = input.read(cx).value().trim().parse::<u64>() {
@@ -195,7 +226,7 @@ impl SettingsView {
                 }
             }),
         ];
-        SettingsView { autosave, editor_font, terminal_font, _subscriptions: subscriptions }
+        SettingsView { autosave, editor_font, terminal_font, icon_size, _subscriptions: subscriptions }
     }
 }
 
@@ -227,6 +258,67 @@ fn number_field(input: &Entity<InputState>, unit: &'static str) -> impl IntoElem
         .gap(px(6.))
         .child(div().w(px(80.)).child(Input::new(input)))
         .child(div().w(px(20.)).text_size(px(11.)).text_color(Palette::faint()).child(unit))
+}
+
+/// Sample of what the icon size affects: file and folder icons, UI glyphs
+/// and a file-tree row, drawn at the current scale.
+fn icon_preview() -> impl IntoElement {
+    const FILES: &[&str] = &["App.swift", "MainActivity.kt", "build.gradle.kts", "AndroidManifest.xml", "Gemfile", "package.json", "main.rs"];
+    let tree_row = |name: &'static str, folder: bool, depth: f32| {
+        let path = StdPath::new(name);
+        div()
+            .h(px(crate::icons::row_height(22., crate::file_icons::ICON_SIZE)))
+            .pl(px(8. + depth * 14.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .text_size(px(12.5))
+            .child(if folder {
+                crate::file_icons::folder_icon_img(path, true)
+            } else {
+                crate::file_icons::file_icon_img(path)
+            })
+            .child(name)
+    };
+    div()
+        .mt(px(6.))
+        .p(px(10.))
+        .rounded(px(8.))
+        .bg(Palette::sidebar_bg())
+        .border_1()
+        .border_color(Palette::hairline())
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(10.))
+                .children(FILES.iter().map(|name| crate::file_icons::file_icon_img(StdPath::new(name))))
+                .child(crate::file_icons::folder_icon_img(StdPath::new("src"), false))
+                .child(crate::file_icons::folder_icon_img(StdPath::new("android"), false)),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .children(
+                    [IconName::PanelLeft, IconName::Search, IconName::GitBranch, IconName::SquareTerminal, IconName::PanelRight]
+                        .into_iter()
+                        .map(|name| crate::icons::ui_icon(name, 16., Palette::muted())),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(tree_row("app", true, 0.))
+                .child(tree_row("MainActivity.kt", false, 1.))
+                .child(tree_row("build.gradle.kts", false, 1.)),
+        )
 }
 
 fn toggle(
@@ -274,6 +366,23 @@ impl Render for SettingsView {
             .child(row("Autosave delay", number_field(&self.autosave, "ms")))
             .child(row("Editor font size", number_field(&self.editor_font, "pt")))
             .child(row("Soft wrap", toggle("soft-wrap", s.soft_wrap, |s, v| s.soft_wrap = v)))
+            .child(section("ICONS"))
+            .child(row(
+                "Icon size",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(div().w(px(180.)).child(Slider::new(&self.icon_size)))
+                    .child(
+                        div()
+                            .w(px(40.))
+                            .text_size(px(12.))
+                            .text_color(Palette::muted())
+                            .child(format!("{:.0}%", s.icon_scale * 100.)),
+                    ),
+            ))
+            .child(icon_preview())
             .child(section("TERMINAL"))
             .child(row("Terminal font size", number_field(&self.terminal_font, "pt")))
             .child(section("WINDOW"))
@@ -305,6 +414,7 @@ mod tests {
             show_inspector: false,
             open_last_project: false,
             launch_full_screen: false,
+            icon_scale: 1.5,
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), settings);

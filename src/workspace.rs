@@ -1180,7 +1180,7 @@ impl Workspace {
 
     // ---- Build -----------------------------------------------------------
 
-    /// ⌘B / ⇧⌘K / Install: saves everything first, like Xcode.
+    /// ⇧⌘B / ⇧⌘K / Install: saves everything first, like Xcode.
     pub fn run_build(&mut self, action: BuildAction, cx: &mut Context<Self>) {
         if self.root.is_none() {
             return;
@@ -1309,7 +1309,7 @@ fn git_root(path: &Path) -> Option<PathBuf> {
 // ---- Rendering --------------------------------------------------------------
 
 fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
-    Icon::new(name).size(px(size)).text_color(color)
+    crate::icons::ui_icon(name, size, color)
 }
 
 fn tool_button(
@@ -1329,6 +1329,9 @@ fn tool_button(
         .hover(|s| s.bg(ca(0xffffff, 0.08)))
         .active(|s| s.bg(ca(0xffffff, 0.14)))
         .child(icon(name, 16., if active { Palette::accent() } else { Palette::muted() }))
+        // Two quick clicks on a button must not reach the toolbar's
+        // double-click handler, which zooms (resizes) the window.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click)
 }
 
@@ -1672,7 +1675,7 @@ impl Workspace {
         div()
             .id(("row", ix))
             .w_full()
-            .h(px(ROW_HEIGHT))
+            .h(px(crate::icons::row_height(ROW_HEIGHT, crate::file_icons::ICON_SIZE)))
             .px(px(6.))
             .cursor_pointer()
             .child(inner)
@@ -1799,7 +1802,7 @@ impl Workspace {
         let mut row = div()
             .id(row_id)
             .group(group.clone())
-            .h(px(ROW_HEIGHT))
+            .h(px(crate::icons::row_height(ROW_HEIGHT, crate::file_icons::ICON_SIZE)))
             .mx(px(6.))
             .px(px(8.))
             .flex()
