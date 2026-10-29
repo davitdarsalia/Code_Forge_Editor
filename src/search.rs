@@ -284,7 +284,10 @@ mod tests {
     use super::*;
 
     fn fixture() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("forge-search-{}", std::process::id()));
+        // Unique per call: tests run in parallel and must not wipe each other's tree.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("forge-search-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("ignored")).unwrap();
