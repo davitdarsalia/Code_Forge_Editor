@@ -1897,6 +1897,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "libc",
  "nucleo-matcher",
  "num_cpus",
  "portable-pty",
