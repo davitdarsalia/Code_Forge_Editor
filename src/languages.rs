@@ -59,13 +59,6 @@ fn grammars() -> Vec<Grammar> {
             locals: "",
         },
         Grammar {
-            name: "dart",
-            language: tree_sitter_dart::LANGUAGE.into(),
-            highlights: tree_sitter_dart::HIGHLIGHTS_QUERY,
-            injections: "",
-            locals: tree_sitter_dart::LOCALS_QUERY,
-        },
-        Grammar {
             name: "batch",
             language: tree_sitter_batch::LANGUAGE.into(),
             highlights: tree_sitter_batch::HIGHLIGHTS_QUERY,
