@@ -1,4 +1,3 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -29,6 +28,7 @@ use crate::recent;
 use crate::index_cache;
 use crate::lsp;
 use crate::diagnostics;
+use crate::document::{self, LoadedText, NavPoint, SaveOutcome};
 use crate::issues_panel;
 use crate::search::{FileIndex, IndexProgress};
 use crate::settings::Settings;
@@ -40,13 +40,11 @@ use crate::theme::{Palette, ca};
 const GIT_REFRESH_DELAY: Duration = Duration::from_millis(600);
 const ACTIVATION_RESYNC_MIN: Duration = Duration::from_secs(2);
 const INDEX_REWALK_MIN: Duration = Duration::from_secs(30);
-const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const TOOLBAR_HEIGHT: f32 = 38.;
 const STATUS_HEIGHT: f32 = 22.;
 const INDEX_TICK: Duration = Duration::from_millis(80);
 const INDEX_BAR_DELAY: Duration = Duration::from_millis(120);
 const MAX_LOG_LINES: usize = 200;
-const MAX_HISTORY: usize = 100;
 const LSP_SYNC_DELAY: Duration = Duration::from_millis(250);
 
 struct Indexing {
@@ -91,11 +89,6 @@ struct Document {
     _subscription: Subscription,
 }
 
-#[derive(Clone, PartialEq)]
-struct NavPoint {
-    path: PathBuf,
-    position: Position,
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Navigator {
@@ -176,95 +169,6 @@ pub struct Workspace {
     _subscriptions: Vec<Subscription>,
 }
 
-fn hash_text(text: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-#[derive(Debug, PartialEq)]
-enum ExternalChange {
-    None,
-    Touched(Option<SystemTime>),
-    Changed,
-}
-
-fn external_change(path: &Path, known_mtime: Option<SystemTime>, saved_hash: u64) -> ExternalChange {
-    let current = mtime(path);
-    if current.is_none() || current == known_mtime {
-        return ExternalChange::None;
-    }
-    match std::fs::read_to_string(path) {
-        Ok(text) if hash_text(&text) == saved_hash => ExternalChange::Touched(current),
-        Ok(_) => ExternalChange::Changed,
-        Err(_) => ExternalChange::None,
-    }
-}
-
-struct LoadedText {
-    text: String,
-    saved_hash: u64,
-    language: &'static str,
-    mtime: Option<SystemTime>,
-}
-
-fn load_text(path: &Path) -> Result<LoadedText, String> {
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if size > MAX_FILE_BYTES {
-        return Err(format!("{} is too large to open", path.display()));
-    }
-    let before = mtime(path);
-    let bytes = std::fs::read(path).map_err(|err| format!("Cannot open {}: {err}", path.display()))?;
-    if files::looks_binary(&bytes) {
-        return Err(format!("{} looks like a binary file", path.display()));
-    }
-    let text = String::from_utf8(bytes)
-        .map_err(|_| format!("{} is not UTF-8 text; not opened to avoid corrupting it", path.display()))?;
-    let saved_hash = hash_text(&text);
-    let language = files::detect_language(path, &text);
-    Ok(LoadedText { text, saved_hash, language, mtime: before })
-}
-
-#[derive(Debug, PartialEq)]
-enum SaveOutcome {
-    Unchanged,
-    Conflict,
-    Superseded,
-    Written { hash: u64, mtime: Option<SystemTime> },
-    Failed { message: String, touched: Option<Option<SystemTime>> },
-}
-
-fn run_save(
-    text: &str,
-    path: &Path,
-    known_mtime: Option<SystemTime>,
-    saved_hash: u64,
-    check_external: bool,
-    seq: u64,
-    gate: &files::WriteGate,
-) -> SaveOutcome {
-    let hash = hash_text(text);
-    if hash == saved_hash {
-        return SaveOutcome::Unchanged;
-    }
-    let mut touched = None;
-    if check_external {
-        match external_change(path, known_mtime, saved_hash) {
-            ExternalChange::None => {}
-            ExternalChange::Touched(mtime) => touched = Some(mtime),
-            ExternalChange::Changed => return SaveOutcome::Conflict,
-        }
-    }
-    match gate.write(seq, path, text.as_bytes()) {
-        Ok(true) => SaveOutcome::Written { hash, mtime: mtime(path) },
-        Ok(false) => SaveOutcome::Superseded,
-        Err(err) => SaveOutcome::Failed { message: format!("Save failed for {}: {err}", path.display()), touched },
-    }
-}
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -676,7 +580,7 @@ impl Workspace {
         let path = path.to_path_buf();
         cx.spawn_in(window, async move |this, cx| {
             let read_path = path.clone();
-            let loaded = cx.background_spawn(async move { load_text(&read_path) }).await;
+            let loaded = cx.background_spawn(async move { document::load_text(&read_path) }).await;
             crate::startup::mark("open: file loaded");
             let _ = this.update_in(cx, |this, window, cx| {
                 let loaded = match loaded {
@@ -779,14 +683,6 @@ impl Workspace {
         Some(NavPoint { path: doc.path.clone(), position: state.text().offset_to_position(state.cursor()) })
     }
 
-    fn push_history(stack: &mut Vec<NavPoint>, point: NavPoint) {
-        if stack.last() != Some(&point) {
-            stack.push(point);
-            if stack.len() > MAX_HISTORY {
-                stack.remove(0);
-            }
-        }
-    }
 
     fn jump_to(&mut self, path: &Path, lsp_start: Position, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.nav_point(cx);
@@ -806,7 +702,7 @@ impl Workspace {
             doc.editor.update(cx, |state, cx| state.set_cursor_position(position, window, cx));
             crate::startup::mark("jump: cursor set");
             if let Some(from) = from {
-                Self::push_history(&mut this.back, from);
+                document::push_history(&mut this.back, from);
                 this.forward.clear();
             }
         });
@@ -893,7 +789,7 @@ impl Workspace {
         let target = if back { self.back.pop() } else { self.forward.pop() };
         let Some(target) = target else { return };
         if let Some(here) = self.nav_point(cx) {
-            Self::push_history(if back { &mut self.forward } else { &mut self.back }, here);
+            document::push_history(if back { &mut self.forward } else { &mut self.back }, here);
         }
         let position = target.position;
         self.open_navigated(&target.path, window, cx, move |this, window, cx| {
@@ -1067,7 +963,7 @@ impl Workspace {
             let outcome = cx
                 .background_spawn(async move {
                     let text = rope.to_string();
-                    run_save(&text, &path, known_mtime, saved_hash, true, seq, &gate)
+                    document::run_save(&text, &path, known_mtime, saved_hash, true, seq, &gate)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -1093,7 +989,7 @@ impl Workspace {
         let seq = doc.save_seq;
         let edit_gen = doc.edit_gen;
         let check = !force && !doc.saving;
-        let outcome = run_save(&text, &doc.path, doc.mtime, doc.saved_hash, check, seq, &doc.gate);
+        let outcome = document::run_save(&text, &doc.path, doc.mtime, doc.saved_hash, check, seq, &doc.gate);
         self.apply_save(id, seq, edit_gen, outcome, cx)
     }
 
@@ -1162,35 +1058,21 @@ impl Workspace {
     }
 
     fn reload_changed_documents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let probes: Vec<(usize, PathBuf, Option<SystemTime>, u64)> = self
+        let probes: Vec<document::ReloadProbe> = self
             .docs
             .iter()
             .filter(|doc| !doc.dirty)
-            .map(|doc| (doc.id, doc.path.clone(), doc.mtime, doc.saved_hash))
+            .map(|doc| document::ReloadProbe { id: doc.id, path: doc.path.clone(), known_mtime: doc.mtime, saved_hash: doc.saved_hash })
             .collect();
         if probes.is_empty() {
             return;
         }
         self.reload_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let changes = cx
-                .background_spawn(async move {
-                    let mut changes = Vec::new();
-                    for (id, path, known, saved_hash) in probes {
-                        let current = mtime(&path);
-                        if current.is_none() || current == known {
-                            continue;
-                        }
-                        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-                        let hash = hash_text(&text);
-                        changes.push((id, current, hash, (hash != saved_hash).then_some(text)));
-                    }
-                    changes
-                })
-                .await;
+            let changes = cx.background_spawn(async move { document::probe_reloads(probes) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.reload_task = None;
                 let mut reloaded = Vec::new();
-                for (id, current, hash, text) in changes {
+                for document::ReloadChange { id, mtime: current, hash, text } in changes {
                     let Some(doc) = this.docs.iter_mut().find(|d| d.id == id) else { continue };
                     if doc.dirty || doc.saving {
                         continue;
@@ -3155,73 +3037,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn external_change_detects_rewrites_but_not_touches() {
-        let dir = std::env::temp_dir().join(format!("forge-ws-ext-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("a.txt");
-        std::fs::write(&path, "one").unwrap();
-        let loaded = mtime(&path);
-        let saved_hash = hash_text("one");
-        assert_eq!(external_change(&path, loaded, saved_hash), ExternalChange::None);
-
-        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
-        assert!(matches!(external_change(&path, Some(old), saved_hash), ExternalChange::Touched(Some(_))));
-
-        std::fs::write(&path, "two").unwrap();
-        assert_eq!(external_change(&path, Some(old), saved_hash), ExternalChange::Changed);
-
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(external_change(&path, loaded, saved_hash), ExternalChange::None);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn run_save_orders_unchanged_conflict_and_superseded() {
-        let dir = std::env::temp_dir().join(format!("forge-ws-save-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("s.txt");
-        std::fs::write(&path, "base").unwrap();
-        let gate = files::WriteGate::default();
-        let known = mtime(&path);
-        let base = hash_text("base");
-
-        assert_eq!(run_save("base", &path, known, base, true, 1, &gate), SaveOutcome::Unchanged);
-
-        let outcome = run_save("edit2", &path, known, base, true, 2, &gate);
-        assert!(matches!(outcome, SaveOutcome::Written { hash, .. } if hash == hash_text("edit2")));
-        assert_eq!(run_save("edit1", &path, known, base, false, 1, &gate), SaveOutcome::Superseded);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edit2");
-
-        let old = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
-        assert_eq!(run_save("edit3", &path, old, base, true, 3, &gate), SaveOutcome::Conflict);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edit2");
-        assert!(matches!(run_save("edit3", &path, old, base, false, 3, &gate), SaveOutcome::Written { .. }));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edit3");
-
-        let missing = dir.join("nope/x.txt");
-        assert!(matches!(run_save("x", &missing, None, base, false, 4, &gate), SaveOutcome::Failed { .. }));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn push_history_skips_duplicates_and_caps_length() {
-        let point = |line: u32| NavPoint { path: PathBuf::from("/p/a.rs"), position: Position { line, character: 0 } };
-        let mut stack = Vec::new();
-        Workspace::push_history(&mut stack, point(1));
-        Workspace::push_history(&mut stack, point(1));
-        assert_eq!(stack.len(), 1);
-        Workspace::push_history(&mut stack, point(2));
-        Workspace::push_history(&mut stack, point(1));
-        assert_eq!(stack.len(), 3);
-        for line in 0..(MAX_HISTORY as u32 + 10) {
-            Workspace::push_history(&mut stack, point(line + 10));
-        }
-        assert_eq!(stack.len(), MAX_HISTORY);
-        assert!(stack.last() == Some(&point(MAX_HISTORY as u32 + 19)));
-        assert!(stack.first() == Some(&point(20)));
-    }
-
-    #[test]
     fn format_bytes_and_shorten_home_render_labels() {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2048), "2.0 KB");
@@ -3241,22 +3056,6 @@ mod tests {
         std::fs::write(&file, "").unwrap();
         assert_eq!(git_root(&file), Some(dir.clone()));
         assert_eq!(git_root(&dir), None);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn load_text_rejects_binary_and_non_utf8() {
-        let dir = std::env::temp_dir().join(format!("forge-ws-load-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ok = dir.join("a.rs");
-        std::fs::write(&ok, "fn main() {}\n").unwrap();
-        let loaded = load_text(&ok).unwrap();
-        assert_eq!(loaded.saved_hash, hash_text(&loaded.text));
-        assert_eq!(loaded.language, "rust");
-        let bin = dir.join("b.bin");
-        std::fs::write(&bin, [0u8, 1, 2, 0, 255]).unwrap();
-        assert!(load_text(&bin).is_err());
-        assert!(load_text(&dir.join("missing")).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

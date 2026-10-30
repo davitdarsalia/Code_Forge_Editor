@@ -7,6 +7,7 @@ mod build_panel;
 mod builtin_lang;
 mod files;
 mod diagnostics;
+mod document;
 mod format;
 mod git;
 mod icons;
