@@ -10,9 +10,10 @@ use gpui_kit::component::input::{
     ShowDocumentHandler,
 };
 use gpui_kit::base::{Spring, spring};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::Icon;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, MouseButton, MouseMoveEvent, Context, Entity, ExternalPaths, FocusHandle,
+    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, MouseButton, MouseMoveEvent, Context, Entity, ExternalPaths, FocusHandle,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, PromptLevel,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
     ScrollStrategy, UniformListScrollHandle, div, prelude::FluentBuilder as _, px, uniform_list,
@@ -922,6 +923,85 @@ impl Workspace {
     fn close_doc(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active = Some(ix);
         self.close_active(window, cx);
+    }
+
+    pub fn close_tabs(&mut self, kind: CloseKind, target: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(anchor) = target.or(self.active) else {
+            if kind == CloseKind::All {
+                self.close_ids(Vec::new(), window, cx);
+            }
+            return;
+        };
+        let dirty: Vec<bool> = self.docs.iter().map(|d| d.dirty).collect();
+        let ids: Vec<usize> = tabs_to_close(kind, anchor, &dirty).into_iter().filter_map(|ix| self.docs.get(ix)).map(|d| d.id).collect();
+        self.close_ids(ids, window, cx);
+    }
+
+    fn close_ids(&mut self, ids: Vec<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let mut unsaved = Vec::new();
+        let mut closing = Vec::new();
+        for id in ids {
+            if self.save_doc(id, false, cx) {
+                closing.push(id);
+            } else {
+                unsaved.push(id);
+            }
+        }
+        for id in closing {
+            self.remove_doc(id, window, cx);
+        }
+        if unsaved.is_empty() {
+            return;
+        }
+        let message = match unsaved.as_slice() {
+            [id] => {
+                let name = self
+                    .docs
+                    .iter()
+                    .find(|d| d.id == *id)
+                    .and_then(|d| d.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_default();
+                format!("“{name}” was not saved")
+            }
+            many => format!("{} files were not saved", many.len()),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            Some("They could not be written or they changed on disk. Close them and lose your edits?"),
+            &["Close Without Saving", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(0) {
+                let result = this.update_in(cx, |this, window, cx| {
+                    for id in unsaved {
+                        this.remove_doc(id, window, cx);
+                    }
+                });
+                if let Err(err) = result {
+                    eprintln!("forge: cannot close tabs: {err}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub fn copy_tab_path(&mut self, relative: bool, target: Option<usize>, cx: &mut Context<Self>) {
+        let Some(doc) = target.or(self.active).and_then(|ix| self.docs.get(ix)) else { return };
+        let text = if relative {
+            match self.root.as_deref().and_then(|root| doc.path.strip_prefix(root).ok()) {
+                Some(rel) => rel.to_string_lossy().into_owned(),
+                None => doc.path.to_string_lossy().into_owned(),
+            }
+        } else {
+            doc.path.to_string_lossy().into_owned()
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    fn doc_ix(&self, id: usize) -> Option<usize> {
+        self.docs.iter().position(|d| d.id == id)
     }
 
     fn schedule_save(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -2166,6 +2246,7 @@ impl Workspace {
     }
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
         div()
             .id("tabs")
             .h(px(30.))
@@ -2177,6 +2258,8 @@ impl Workspace {
             .border_color(Palette::border())
             .children(self.docs.iter().enumerate().map(|(ix, doc)| {
                 let active = self.active == Some(ix);
+                let id = doc.id;
+                let entity = entity.clone();
                 let name = doc.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 div()
                     .id(("tab", ix))
@@ -2219,6 +2302,46 @@ impl Workspace {
                             })),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
+                    .on_mouse_up(MouseButton::Middle, cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_doc(ix, window, cx);
+                    }))
+                    .context_menu(move |menu, _, _| {
+                        let item = |label: &'static str, kind: CloseKind| {
+                            let entity = entity.clone();
+                            PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    if let Some(ix) = this.doc_ix(id) {
+                                        this.close_tabs(kind, Some(ix), window, cx);
+                                    }
+                                });
+                            })
+                        };
+                        let copy = |label: &'static str, relative: bool| {
+                            let entity = entity.clone();
+                            PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                                entity.update(cx, |this, cx| this.copy_tab_path(relative, this.doc_ix(id), cx));
+                            })
+                        };
+                        let reveal = entity.clone();
+                        menu.item(item("Close", CloseKind::This))
+                            .item(item("Close Others", CloseKind::Others))
+                            .item(item("Close to the Right", CloseKind::Right))
+                            .item(item("Close to the Left", CloseKind::Left))
+                            .item(item("Close Saved", CloseKind::Saved))
+                            .item(item("Close All", CloseKind::All))
+                            .separator()
+                            .item(copy("Copy Path", false))
+                            .item(copy("Copy Relative Path", true))
+                            .item(PopupMenuItem::new("Reveal in Navigator").on_click(move |_, _, cx| {
+                                reveal.update(cx, |this, cx| {
+                                    if let Some(ix) = this.doc_ix(id) {
+                                        this.active = Some(ix);
+                                        this.reveal_active(cx);
+                                    }
+                                });
+                            }))
+                    })
             }))
     }
 
@@ -3060,5 +3183,64 @@ mod tests {
         assert!(load_text(&bin).is_err());
         assert!(load_text(&dir.join("missing")).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CloseKind {
+    This,
+    Others,
+    Left,
+    Right,
+    Saved,
+    All,
+}
+
+pub fn tabs_to_close(kind: CloseKind, anchor: usize, dirty: &[bool]) -> Vec<usize> {
+    (0..dirty.len())
+        .filter(|&ix| match kind {
+            CloseKind::This => ix == anchor,
+            CloseKind::Others => ix != anchor,
+            CloseKind::Left => ix < anchor,
+            CloseKind::Right => ix > anchor,
+            CloseKind::Saved => !dirty[ix],
+            CloseKind::All => true,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tab_close_tests {
+    use super::*;
+
+    const DIRTY: [bool; 5] = [false, true, false, false, true];
+
+    #[test]
+    fn this_closes_only_anchor() {
+        assert_eq!(tabs_to_close(CloseKind::This, 2, &DIRTY), vec![2]);
+    }
+
+    #[test]
+    fn others_skips_anchor() {
+        assert_eq!(tabs_to_close(CloseKind::Others, 1, &DIRTY), vec![0, 2, 3, 4]);
+    }
+
+    #[test]
+    fn right_and_left_are_exclusive_of_anchor() {
+        assert_eq!(tabs_to_close(CloseKind::Right, 2, &DIRTY), vec![3, 4]);
+        assert_eq!(tabs_to_close(CloseKind::Left, 2, &DIRTY), vec![0, 1]);
+        assert!(tabs_to_close(CloseKind::Right, 4, &DIRTY).is_empty());
+        assert!(tabs_to_close(CloseKind::Left, 0, &DIRTY).is_empty());
+    }
+
+    #[test]
+    fn saved_skips_dirty() {
+        assert_eq!(tabs_to_close(CloseKind::Saved, 0, &DIRTY), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn all_closes_everything() {
+        assert_eq!(tabs_to_close(CloseKind::All, 3, &DIRTY), vec![0, 1, 2, 3, 4]);
+        assert!(tabs_to_close(CloseKind::All, 0, &[]).is_empty());
     }
 }
