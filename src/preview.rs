@@ -4,8 +4,9 @@ use std::time::Duration;
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 pub const DEFAULT_FRACTION: f32 = 0.5;
 pub const FRACTION_RANGE: (f32, f32) = (0.15, 0.85);
-pub const ZOOM_RANGE: (f32, f32) = (0.02, 32.);
-pub const ZOOM_STEP: f32 = 1.25;
+pub const ZOOM_STEPS: [f32; 18] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1., 1.5, 2., 3., 5., 7., 10., 15., 20.];
+pub const ZOOM_RANGE: (f32, f32) = (ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
+const STEP_EPSILON: f32 = 1e-3;
 pub const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,11 +131,36 @@ pub fn clamp_scale(scale: f32) -> f32 {
 }
 
 pub fn zoom_in(scale: f32) -> f32 {
-    clamp_scale(scale * ZOOM_STEP)
+    ZOOM_STEPS.iter().copied().find(|&step| step > scale + STEP_EPSILON).unwrap_or(ZOOM_RANGE.1)
 }
 
 pub fn zoom_out(scale: f32) -> f32 {
-    clamp_scale(scale / ZOOM_STEP)
+    ZOOM_STEPS.iter().rev().copied().find(|&step| step < scale - STEP_EPSILON).unwrap_or(ZOOM_RANGE.0)
+}
+
+pub fn zoom_label(zoom: Zoom, scale: f32) -> String {
+    match zoom {
+        Zoom::Fit => "Whole Image".to_string(),
+        Zoom::Scale(_) => format!("{}%", (scale * 100.).round() as i64),
+    }
+}
+
+pub fn clamp_scroll(scroll: f32, content: f32, pane: f32) -> f32 {
+    if content <= pane || !scroll.is_finite() { 0. } else { scroll.clamp(0., content - pane) }
+}
+
+pub fn image_origin(content: f32, pane: f32, scroll: f32) -> f32 {
+    if content <= pane { (pane - content) / 2. } else { -clamp_scroll(scroll, content, pane) }
+}
+
+pub fn anchored_scroll(pointer: f32, old_content: f32, new_content: f32, pane: f32, scroll: f32) -> f32 {
+    let origin = image_origin(old_content, pane, scroll);
+    let fraction = if old_content > 0. { ((pointer - origin) / old_content).clamp(0., 1.) } else { 0.5 };
+    clamp_scroll(fraction * new_content - pointer, new_content, pane)
+}
+
+pub fn format_dimensions(width: u32, height: u32) -> String {
+    format!("{width}×{height}")
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -211,6 +237,52 @@ mod tests {
         assert_eq!(zoom_in(ZOOM_RANGE.1), ZOOM_RANGE.1);
         assert_eq!(zoom_out(ZOOM_RANGE.0), ZOOM_RANGE.0);
         assert_eq!(clamp_scale(f32::INFINITY), 1.);
+    }
+
+    #[test]
+    fn zoom_steps_follow_vscode() {
+        assert_eq!(zoom_in(1.), 1.5);
+        assert_eq!(zoom_in(1.2), 1.5);
+        assert_eq!(zoom_in(0.05), 0.1);
+        assert_eq!(zoom_in(15.), 20.);
+        assert_eq!(zoom_out(1.), 0.9);
+        assert_eq!(zoom_out(1.2), 1.);
+        assert_eq!(zoom_out(0.37), 0.3);
+        assert_eq!(zoom_out(0.1), 0.1);
+        let mut scale = 0.1;
+        let mut seen = vec![scale];
+        while scale < ZOOM_RANGE.1 {
+            scale = zoom_in(scale);
+            seen.push(scale);
+        }
+        assert_eq!(seen, ZOOM_STEPS.to_vec());
+    }
+
+    #[test]
+    fn zoom_labels() {
+        assert_eq!(zoom_label(Zoom::Fit, 0.42), "Whole Image");
+        assert_eq!(zoom_label(Zoom::Scale(1.5), 1.5), "150%");
+        assert_eq!(zoom_label(Zoom::Scale(0.1), 0.1), "10%");
+        assert_eq!(format_dimensions(1024, 768), "1024×768");
+    }
+
+    #[test]
+    fn small_images_center_and_large_images_scroll() {
+        assert_eq!(image_origin(100., 400., 50.), 150.);
+        assert_eq!(image_origin(1000., 400., 50.), -50.);
+        assert_eq!(image_origin(1000., 400., 900.), -600.);
+        assert_eq!(clamp_scroll(-5., 1000., 400.), 0.);
+        assert_eq!(clamp_scroll(f32::NAN, 1000., 400.), 0.);
+    }
+
+    #[test]
+    fn zoom_keeps_the_point_under_the_pointer() {
+        let scroll = anchored_scroll(200., 400., 800., 400., 0.);
+        assert_eq!(scroll, 200.);
+        assert_eq!(image_origin(800., 400., scroll) + 0.5 * 800., 200.);
+        let scroll = anchored_scroll(100., 1000., 2000., 400., 300.);
+        assert_eq!(scroll, 700.);
+        assert_eq!(anchored_scroll(100., 1000., 200., 400., 300.), 0.);
     }
 
     #[test]

@@ -100,6 +100,7 @@ struct Document {
     preview: Option<Entity<PreviewPane>>,
     image: Option<Entity<ImageView>>,
     _subscription: Subscription,
+    _observers: Vec<Subscription>,
 }
 
 
@@ -722,6 +723,12 @@ impl Workspace {
             _ => {}
         });
         self.issues.attach(path, &editor, cx);
+        let observers = image
+            .clone()
+            .into_iter()
+            .chain(preview.as_ref().and_then(|pane| pane.read(cx).image_view()))
+            .map(|view| cx.observe(&view, |_, _, cx| cx.notify()))
+            .collect();
         self.docs.push(Document {
             id,
             path: path.to_path_buf(),
@@ -741,6 +748,7 @@ impl Workspace {
             preview,
             image,
             _subscription: subscription,
+            _observers: observers,
         });
         if let Some(tree) = self.tree.as_mut() {
             tree.reveal(path);
@@ -2441,6 +2449,10 @@ impl Workspace {
             if let Some(pane) = doc.preview.as_ref() {
                 let visible = self.active == Some(ix) && self.show_preview;
                 pane.update(cx, |pane, cx| pane.set_visible(visible, cx));
+                if visible {
+                    let line = doc.editor.read(cx).cursor_position().line as usize;
+                    pane.update(cx, |pane, cx| pane.sync_line(line, cx));
+                }
             }
         }
         let content = match self.active.and_then(|ix| self.docs.get(ix)) {
@@ -2829,7 +2841,9 @@ impl Workspace {
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let doc = self.active.and_then(|ix| self.docs.get(ix));
-        let cursor = doc.map(|doc| doc.editor.read(cx).cursor_position());
+        let raster = doc.is_some_and(|doc| doc.image.is_some());
+        let cursor = doc.filter(|_| !raster).map(|doc| doc.editor.read(cx).cursor_position());
+        let image_status = self.active_image_view(cx).and_then(|view| view.read(cx).status());
         let index_status = self.render_index_status(cx);
         div()
             .h(px(STATUS_HEIGHT))
@@ -2868,11 +2882,13 @@ impl Workspace {
                 )
             })
             .child(div().flex_1())
+            .when_some(image_status, |el, status| el.child(status.dimensions).child(status.size).child(status.zoom))
             .when_some(cursor, |el, cursor| {
                 el.child(format!("Ln {}, Col {}", cursor.line + 1, cursor.character + 1))
             })
-            .when_some(doc, |el, doc| el.child(files::language_for(&doc.path)))
-            .child("UTF-8")
+            .when(!raster, |el| {
+                el.when_some(doc, |el, doc| el.child(files::language_for(&doc.path))).child("UTF-8")
+            })
     }
 
     fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3067,8 +3083,15 @@ impl Workspace {
         }
     }
 
+    fn active_image_view(&self, cx: &App) -> Option<Entity<ImageView>> {
+        let doc = self.active_doc()?;
+        doc.image.clone().or_else(|| {
+            doc.preview.as_ref().filter(|_| self.show_preview).and_then(|pane| pane.read(cx).image_view())
+        })
+    }
+
     pub fn zoom_image(&mut self, change: ImageZoom, cx: &mut Context<Self>) {
-        let Some(image) = self.active_doc().and_then(|doc| doc.image.clone()) else { return };
+        let Some(image) = self.active_image_view(cx) else { return };
         image.update(cx, |view, cx| match change {
             ImageZoom::In => view.zoom_in(cx),
             ImageZoom::Out => view.zoom_out(cx),

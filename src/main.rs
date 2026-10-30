@@ -18,6 +18,9 @@ mod icons;
 mod index_cache;
 mod issues_panel;
 mod languages;
+mod markdown_model;
+mod markdown_view;
+mod net;
 mod lsp;
 mod quick_open;
 mod recent;
@@ -136,6 +139,9 @@ const EXTRA_ICONS: &[(&str, &[u8])] = &[
     ("icons/undo-2.svg", include_bytes!("../assets/icons/undo-2.svg")),
     ("icons/circle-dot.svg", include_bytes!("../assets/icons/circle-dot.svg")),
     ("icons/hammer.svg", include_bytes!("../assets/icons/hammer.svg")),
+    ("icons/lightbulb.svg", include_bytes!("../assets/icons/lightbulb.svg")),
+    ("icons/message-square-warning.svg", include_bytes!("../assets/icons/message-square-warning.svg")),
+    ("icons/octagon-alert.svg", include_bytes!("../assets/icons/octagon-alert.svg")),
 ];
 
 impl AssetSource for Assets {
@@ -578,7 +584,7 @@ fn main() {
     startup::init();
     let launch_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
 
-    let app = gpui_kit::application().with_assets(Assets);
+    let app = gpui_kit::application().with_assets(Assets).with_http_client(std::sync::Arc::new(net::CurlClient));
     app.on_open_urls(|urls| {
         let paths: Vec<PathBuf> = urls
             .iter()
