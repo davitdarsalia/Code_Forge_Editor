@@ -69,6 +69,10 @@ Forge is a single-crate macOS code editor. `main.rs` (612 lines) registers actio
 - **Explanation:** One struct with ~55 fields owns window layout, documents, autosave, external-reload, navigation history, git state, clone dialog, indexing + index log, LSP manager, preview, terminal, notices. Every feature change lands here (shotgun surgery magnet) and it blocks parallel work (merge conflicts).
 - **Evidence:** `src/workspace.rs:111-166` (struct), 2762 lines total, ~45 `render_*` and method clusters: clone dialog `:2455-2620`, changes panel `:1725-1910`, index status/log `:2186-2312`, welcome `:2348-2454`, git ops `:1005-1200`, nav history `:660-760`, doc lifecycle `:541-870`. Only one `#[test]` in the file.
 - **Found by:** Structure & Boundaries, Coupling
+- **Status:** Partially fixed
+- **Status reason:** workspace.rs 3280 -> 2937 lines. Extracted: pure document logic (`src/document.rs`: hash/mtime/external_change/load_text/run_save/nav history/reload probe, a6f8a02), shared widgets (`src/ui.rs`, aaf6d2b), `CloneDialog` entity with `CloneEvent` (`src/clone_dialog.rs`, d598e0e). Remaining, in order: ChangesPanel (git state + commit input, emits data events; run_git stays in Workspace), Indexer/IndexStatus (indexing, cache, log; give the detached cache-save a ticket), Welcome (stateless component + handler), TabStrip (CloseKind/tabs_to_close + render), bottom panel, then DocumentStore (highest risk).
+- **Status date:** 2026-10-30 10:00 UTC
+- **Status commit:** d598e0e
 
 ### [F-2] Synchronous filesystem work on the UI thread
 - **Category:** 12 Hidden side effects / 25 (logic in UI layer); violates the stated goal
@@ -108,6 +112,9 @@ Forge is a single-crate macOS code editor. `main.rs` (612 lines) registers actio
 - **Evidence:** `src/files.rs:144-232` (`language_for`, `detect_language`, `"rs" => "rust"` `:161`, `"swift" => "swift"` `:162,:230`); `src/languages.rs:19-60` grammar vec built in code with `include_str!` queries; `src/format.rs:39-41` per-language tool table; `src/lsp.rs:42-52`.
 - **Found by:** Structure, Coupling
 - **Parallel work:** w2-syntax and w2-binsize touch `languages.rs`/`Cargo.toml`.
+- **Status:** Skipped
+- **Status reason:** Deferred (session stopped). A full LanguageSpec registry touches files.rs, languages.rs, format.rs TABLE, lsp SPECS, builtin_lang and file_icons: high churn. Cheaper first step: a known-language-id list plus a cross-module consistency test (every id in format TABLE / lsp SPECS / builtin_lang / grammars must be one `language_for` can produce).
+- **Status date:** 2026-10-30 10:00 UTC
 
 ### [F-5] Inconsistent threading/async model with no central executor or cancellation
 - **Category:** 6 Leaky abstractions / 34 Inconsistent conventions
@@ -115,6 +122,9 @@ Forge is a single-crate macOS code editor. `main.rs` (612 lines) registers actio
 - **Explanation:** Three models coexist: GPUI `background_spawn`, ad-hoc `std::thread::spawn`, and dedicated threads with flume channels. Cancellation is per-site (drop task, `AtomicBool`, kill thread). `search` spawns `num_cpus` OS threads per query; `format` spawns 3 threads per run; each LSP server spawns 3 unbounded threads.
 - **Evidence:** `src/search.rs:204-208` (thread per CPU per search), `src/format.rs:245,253,261`, `src/lsp.rs:245,256,290`, `src/terminal.rs:86`, `src/build.rs:503,556,559` vs `src/workspace.rs:402` etc.
 - **Found by:** Coupling, Integration & Data
+- **Status:** Skipped
+- **Status reason:** Not clearly beneficial. `search` spawns num_cpus threads per query, which costs microseconds next to disk-bound grep, and a shared cancel flag stops them. `fuzzy` uses scoped threads capped at 8. Moving blocking file reads onto GPUI's background executor could starve index/git/save work. Revisit only with a measurement (e.g. many rapid queries on a 100k-file tree).
+- **Status date:** 2026-10-30 10:00 UTC
 
 ### [F-6] Async results lack ticket/epoch checks outside indexing; task slots are overloaded
 - **Category:** 27 Temporal coupling / 26 Poor transactional boundaries
@@ -122,6 +132,10 @@ Forge is a single-crate macOS code editor. `main.rs` (612 lines) registers actio
 - **Explanation:** The project's own rule ("async work that can go stale carries a ticket") is applied to the index but not git: a git refresh started for an old root can overwrite `repo`/`git_marks` after `open_project` cleared them. `git_task` is used both as a debounce timer and the refresh task; `git_busy`/`clone_busy` booleans stand in for a state machine.
 - **Evidence:** `src/workspace.rs:1005-1035` (`schedule_git_refresh` and `refresh_git` both assign `git_task`; the `update` closure applies `state` with no root check, unlike `:417`), `:362` (`self.repo = None` on open_project), `:1186` clone.
 - **Found by:** Coupling, Error Handling
+- **Revalidated 2026-10-30:** git refresh is less exposed than reported. `refresh_git` replaces `git_task`, and dropping a GPUI `Task` cancels the old future, so an old-root result is not applied after `open_project`. Real stale paths remaining: `confirm_discard` resolves `root` when the prompt is answered, not when it opens, so it could discard in a newly opened project; the detached index cache-save writes the log and `cache_in_sync` of whatever project is open when it finishes; `git_task` is still shared by the debounce timer and the refresh.
+- **Status:** Skipped
+- **Status reason:** Stopped by coordinator before starting (workspace.rs needed for feature work). Plan: `src/task_slot.rs` (`Generation` + `TaskSlot { ticket, is_current, set, cancel }` with unit tests), separate git debounce from refresh, capture root/ticket in confirm_discard and cache-save.
+- **Status date:** 2026-10-30 10:00 UTC
 
 ### [F-7] No logging facade; errors often go to `eprintln!` or are discarded
 - **Category:** 21 No observability / 34 Inconsistent error/logging / 20
@@ -129,6 +143,9 @@ Forge is a single-crate macOS code editor. `main.rs` (612 lines) registers actio
 - **Explanation:** 42 `eprintln!` calls and ~20 `let _ =`/`.ok()` in `workspace.rs`; no levels, no log file, no structured diagnostics. Background failures (git refresh `.ok()` at `:1022`, tree read errors) surface nowhere for the user. Grows worse with many LSPs, each needing per-server logs.
 - **Evidence:** `src/files.rs:47` (`eprintln!("forge: cannot read ...")`), `src/files.rs:247`, `src/workspace.rs:1022` (`git::read_state(&root).ok()`), `src/startup.rs` as the only instrumentation.
 - **Found by:** Error Handling
+- **Status:** Skipped
+- **Status reason:** Deferred (session stopped). 50 `eprintln!` across 14 files (36 outside tests). Plan: `src/log.rs` with `log_error!`/`log_warn!` (same "forge: ..." stderr output) and `log_debug!` gated by an AtomicBool set from `FORGE_LOG` (no formatting cost when off), then replace call sites and log `git::read_state` errors instead of `.ok()`.
+- **Status date:** 2026-10-30 10:00 UTC
 
 ### [F-8] Flat single crate: no enforced layering between logic and GPUI
 - **Category:** 3 Tight coupling / 29 Utility dumping ground
@@ -139,7 +156,7 @@ Forge is a single-crate macOS code editor. `main.rs` (612 lines) registers actio
 - **Status:** Partially fixed
 - **Status reason:** Tool discovery (`search_dirs`, `which`, `xcrun_find`) moved out of `format.rs` into `src/tools.rs`; `lsp.rs` no longer imports `format`, and the duplicated xcrun lookup is one function. Crate split (fix-plan step 11) not attempted: very high churn, no enforcement benefit until branches stop landing in `src/`.
 - **Status date:** 2026-10-30 09:00 UTC
-- **Status commit:** TOOLS_SHA
+- **Status commit:** 58f2f54
 
 ### [F-9] Critical editor behaviour is untested
 - **Category:** 32 Missing tests
@@ -147,6 +164,10 @@ Forge is a single-crate macOS code editor. `main.rs` (612 lines) registers actio
 - **Explanation:** Save/conflict/reload, navigation history, tab management, git result application have no tests because they live inside `Workspace` methods needing a GPUI context. `external_change` and `hash_text` are testable free fns but also untested. Test fixtures (temp dirs with `remove_dir_all(...).unwrap()`) are hand-rolled in 6 modules.
 - **Evidence:** 1 test in `src/workspace.rs`; fixtures at `src/build.rs:642-719`, `src/git.rs:501-549`, `src/lsp.rs:621-671`, `src/scheme_cache.rs:138-172`, `src/search.rs:287-293`, `src/files.rs:274-283`.
 - **Found by:** Security & Code Quality
+- **Status:** Partially fixed
+- **Status reason:** Added tests for nav history, label formatting, git_root, tool lookup, xcrun miss, reload probes; save/conflict/load tests moved with document.rs. 132 -> 138 passing. Shared TempDir fixture not done.
+- **Status date:** 2026-10-30 10:00 UTC
+- **Status commit:** a6f8a02
 
 ### [F-10] Mixed global state
 - **Category:** 1 Global mutable state
