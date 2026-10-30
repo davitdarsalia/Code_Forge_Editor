@@ -4,6 +4,7 @@ mod file_icons;
 mod commands;
 mod build;
 mod build_panel;
+mod builtin_lang;
 mod files;
 mod diagnostics;
 mod format;
