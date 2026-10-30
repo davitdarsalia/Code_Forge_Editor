@@ -22,6 +22,7 @@ mod scheme_cache;
 mod search;
 mod search_panel;
 mod symbols;
+mod rename;
 mod settings;
 mod startup;
 mod terminal;
@@ -79,6 +80,7 @@ actions!(
         QuickOpenFile,
         FindInProject,
         JumpToDefinition,
+        RenameSymbol,
         GoBack,
         GoForward,
         FormatFile,
@@ -320,6 +322,7 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
             MenuItem::separator(),
             MenuItem::action("Format File", FormatFile),
+            MenuItem::action("Rename Symbol…", RenameSymbol),
         ]),
         Menu::new("View").items([
             MenuItem::submenu(Menu::new("Navigators").items([
@@ -467,6 +470,7 @@ fn register_actions(cx: &mut App) {
         with_workspace(cx, |ws, window, cx| ws.show_search(window, cx))
     });
     cx.on_action(|_: &JumpToDefinition, cx| with_workspace(cx, |ws, window, cx| ws.go_to_definition(window, cx)));
+    cx.on_action(|_: &RenameSymbol, cx| with_workspace(cx, |ws, window, cx| ws.rename_symbol(window, cx)));
     cx.on_action(|_: &GoBack, cx| with_workspace(cx, |ws, window, cx| ws.step_history(true, window, cx)));
     cx.on_action(|_: &GoForward, cx| with_workspace(cx, |ws, window, cx| ws.step_history(false, window, cx)));
     cx.on_action(|_: &GitPull, cx| with_workspace(cx, |ws, window, cx| ws.run_remote("Pull", git::pull, window, cx)));
@@ -520,6 +524,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-3", ShowChangesNavigator, None),
         KeyBinding::new("cmd-shift-j", RevealInNavigator, None),
         KeyBinding::new("ctrl-cmd-j", JumpToDefinition, None),
+        KeyBinding::new("f2", RenameSymbol, None),
         KeyBinding::new("ctrl-cmd-left", GoBack, None),
         KeyBinding::new("ctrl-cmd-right", GoForward, None),
         KeyBinding::new("cmd-r", ToggleInspector, None),

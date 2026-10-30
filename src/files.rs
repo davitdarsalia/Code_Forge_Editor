@@ -106,6 +106,38 @@ impl Node {
         }
     }
 
+    pub fn unloaded_ancestors(&mut self, path: &Path) -> Vec<PathBuf> {
+        let Ok(relative) = path.strip_prefix(&self.path) else { return Vec::new() };
+        let components: Vec<_> = relative.components().collect();
+        let mut current = self.path.clone();
+        let mut missing = Vec::new();
+        let mut dead = false;
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            current.push(component);
+            let loaded = !dead && self.find_mut(&current).is_some_and(|n| n.children.is_some());
+            if !loaded {
+                dead = true;
+                missing.push(current.clone());
+            }
+        }
+        missing
+    }
+
+    pub fn reveal_with(&mut self, path: &Path, listings: &mut HashMap<PathBuf, Vec<Node>>) {
+        let Ok(relative) = path.strip_prefix(&self.path) else { return };
+        let mut current = self.path.clone();
+        let components: Vec<_> = relative.components().collect();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            current.push(component);
+            if let Some(node) = self.find_mut(&current) {
+                node.expanded = true;
+                if node.children.is_none() {
+                    node.children = Some(listings.remove(&current).unwrap_or_default());
+                }
+            }
+        }
+    }
+
     fn find_mut(&mut self, path: &Path) -> Option<&mut Node> {
         if self.path == path {
             return Some(self);
@@ -363,6 +395,25 @@ mod tests {
         tree.apply_listings(&mut listings);
         let names: Vec<String> = tree.rows().into_iter().map(|r| r.name).collect();
         assert_eq!(names, ["a", "b", "f.txt", "g.txt", "new.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reveal_expands_ancestors_from_background_listings() {
+        let dir = std::env::temp_dir().join(format!("forge-files-reveal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::fs::write(dir.join("a/b/c/f.txt"), "").unwrap();
+        let mut tree = Node::root(&dir);
+        let target = dir.join("a/b/c/f.txt");
+        let missing = tree.unloaded_ancestors(&target);
+        assert_eq!(missing, [dir.join("a"), dir.join("a/b"), dir.join("a/b/c")]);
+        let mut listings: HashMap<PathBuf, Vec<Node>> = missing.into_iter().map(|p| { let l = list_dir(&p); (p, l) }).collect();
+        tree.reveal_with(&target, &mut listings);
+        assert!(tree.unloaded_ancestors(&target).is_empty());
+        let names: Vec<String> = tree.rows().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["a", "b", "c", "f.txt"]);
+        assert!(tree.unloaded_ancestors(Path::new("/elsewhere/x.rs")).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

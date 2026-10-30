@@ -3,7 +3,7 @@ use gpui_kit::Action;
 use crate::{
     Build, ClearRecent, CleanBuild, CloneRepository, CloseTab, CloseOtherTabs, CloseTabsToRight, CloseTabsToLeft, CloseSavedTabs, CloseAllTabs, CopyPath, CopyRelativePath, FindInProject, FocusCommit, FocusTerminal,
     FormatFile, GitFetch, GoBack, GoForward, JumpToDefinition, GitPull, GitPush, InstallBuild, Minimize, NewFile, NewTerminal, NewWindow, NextTab,
-    OpenFolder, OpenSettings, PreviousTab, QuickOpenFile, Quit, RevealInNavigator, SaveAll, SaveFile,
+    OpenFolder, OpenSettings, PreviousTab, QuickOpenFile, RenameSymbol, Quit, RevealInNavigator, SaveAll, SaveFile,
     ShowChangesNavigator, ShowFilesNavigator, ShowSearchNavigator, StopBuild, ToggleInspector, ToggleNavigator,
     ToggleTerminal, Zoom,
 };
@@ -43,6 +43,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "Find in Project…", keys: "⇧⌘F", action: || Box::new(FindInProject) },
     Command { name: "Reveal in Navigator", keys: "⇧⌘J", action: || Box::new(RevealInNavigator) },
     Command { name: "Jump to Definition", keys: "⌃⌘J", action: || Box::new(JumpToDefinition) },
+    Command { name: "Rename Symbol…", keys: "F2", action: || Box::new(RenameSymbol) },
     Command { name: "Go Back", keys: "⌃⌘←", action: || Box::new(GoBack) },
     Command { name: "Go Forward", keys: "⌃⌘→", action: || Box::new(GoForward) },
     Command { name: "Show Next Tab", keys: "⇧⌘]", action: || Box::new(NextTab) },

@@ -651,6 +651,7 @@ fn initialize_request(kind: Kind, root: &Path) -> Value {
                 "textDocument": {
                     "synchronization": { "dynamicRegistration": false, "didSave": true },
                     "definition": { "dynamicRegistration": false, "linkSupport": true },
+                    "rename": { "dynamicRegistration": false, "prepareSupport": true, "prepareSupportDefaultBehavior": 1 },
                     "diagnostic": { "dynamicRegistration": false, "relatedDocumentSupport": true },
                     "publishDiagnostics": {
                         "relatedInformation": true,
@@ -662,6 +663,7 @@ fn initialize_request(kind: Kind, root: &Path) -> Value {
                 "workspace": {
                     "configuration": true,
                     "workspaceFolders": true,
+                    "workspaceEdit": { "documentChanges": true },
                     "didChangeConfiguration": { "dynamicRegistration": false },
                     "diagnostics": { "refreshSupport": false },
                 },
@@ -1307,9 +1309,121 @@ impl DefinitionProvider for Definitions {
     }
 }
 
+pub struct PrepareRename {
+    pub range: Range,
+    pub placeholder: String,
+}
+
+fn parse_range(value: &Value) -> Option<Range> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn parse_prepare(value: &Value, text: &Rope) -> Option<PrepareRename> {
+    let from_range = |range: Range| {
+        let range = Range::new(from_lsp(text, range.start), from_lsp(text, range.end));
+        let line = line_text(text, range.start.line);
+        let placeholder: String = line
+            .chars()
+            .skip(range.start.character as usize)
+            .take(range.end.character.saturating_sub(range.start.character) as usize)
+            .collect();
+        PrepareRename { range, placeholder }
+    };
+    if let Some(range) = parse_range(value) {
+        return Some(from_range(range));
+    }
+    let range = parse_range(value.get("range")?)?;
+    let mut prepared = from_range(range);
+    if let Some(placeholder) = value.get("placeholder").and_then(Value::as_str) {
+        prepared.placeholder = placeholder.to_string();
+    }
+    Some(prepared)
+}
+
+pub enum PrepareOutcome {
+    Target(PrepareRename),
+    Nothing,
+    Unsupported,
+}
+
+impl Definitions {
+    fn rename_server(&self, text: &Rope, cx: &mut App) -> Option<Result<(Rc<Server>, String)>> {
+        let manager = self.manager.upgrade()?;
+        let kind = manager.server_kind(self.kind)?;
+        let server = match manager.server(kind, &self.path, cx) {
+            Ok(server) => server,
+            Err(reason) => return Some(Err(anyhow!(reason))),
+        };
+        let uri = path_to_uri(&self.path);
+        server.sync(&uri, kind.language_id(self.language, &self.path), self.stale.replace(false), text);
+        Some(Ok((server, uri)))
+    }
+
+    pub fn can_rename(&self) -> bool {
+        self.manager.upgrade().is_some_and(|manager| manager.server_kind(self.kind).is_some())
+    }
+
+    pub fn prepare_rename(&self, text: &Rope, offset: usize, cx: &mut App) -> Option<Task<Result<PrepareOutcome>>> {
+        let (server, uri) = match self.rename_server(text, cx)? {
+            Ok(found) => found,
+            Err(err) => return Some(Task::ready(Err(err))),
+        };
+        let reply = server.request(
+            "textDocument/prepareRename",
+            json!({ "textDocument": { "uri": uri }, "position": to_lsp(text, offset) }),
+        );
+        let text = text.clone();
+        Some(cx.spawn(async move |_| {
+            let value = match reply.recv_async().await.map_err(|_| anyhow!("language server stopped"))? {
+                Ok(value) => value,
+                Err(ServerError::Busy) => return Err(anyhow!(ServerError::Busy)),
+                Err(_) => return Ok(PrepareOutcome::Unsupported),
+            };
+            if value.is_null() || value.get("defaultBehavior").is_some() {
+                return Ok(if value.is_null() { PrepareOutcome::Nothing } else { PrepareOutcome::Unsupported });
+            }
+            Ok(parse_prepare(&value, &text).map_or(PrepareOutcome::Unsupported, PrepareOutcome::Target))
+        }))
+    }
+
+    pub fn rename(&self, text: &Rope, offset: usize, new_name: String, cx: &mut App) -> Option<Task<Result<Option<lsp_types::WorkspaceEdit>>>> {
+        let (server, uri) = match self.rename_server(text, cx)? {
+            Ok(found) => found,
+            Err(err) => return Some(Task::ready(Err(err))),
+        };
+        let reply = server.request(
+            "textDocument/rename",
+            json!({ "textDocument": { "uri": uri }, "position": to_lsp(text, offset), "newName": new_name }),
+        );
+        Some(cx.spawn(async move |_| {
+            let value = reply.recv_async().await.map_err(|_| anyhow!("language server stopped"))??;
+            Ok(serde_json::from_value::<Option<lsp_types::WorkspaceEdit>>(value)?)
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_rename_shapes_parse() {
+        let text = Rope::from("let 😀 = foo\n");
+        let bare = json!({ "start": { "line": 0, "character": 9 }, "end": { "line": 0, "character": 12 } });
+        let parsed = parse_prepare(&bare, &text).unwrap();
+        assert_eq!(parsed.placeholder, "foo");
+        assert_eq!(parsed.range.start, Position::new(0, 8));
+        let with = json!({ "range": bare, "placeholder": "foo_" });
+        assert_eq!(parse_prepare(&with, &text).unwrap().placeholder, "foo_");
+        assert!(parse_prepare(&json!({ "defaultBehavior": true }), &text).is_none());
+    }
+
+    #[test]
+    fn rename_capabilities_are_advertised() {
+        let request = initialize_request(Kind::Rust, Path::new("/p"));
+        assert_eq!(request.pointer("/params/capabilities/textDocument/rename/prepareSupport"), Some(&json!(true)));
+        assert_eq!(request.pointer("/params/capabilities/workspace/workspaceEdit/documentChanges"), Some(&json!(true)));
+    }
 
     #[test]
     fn uris_round_trip_with_escapes() {
@@ -1651,6 +1765,49 @@ mod tests {
         server.sync(&uri, "swift", true, &Rope::from("let x: Int = \"hello\"\n"));
         let diagnostics = wait_for_errors(&receiver, &file);
         assert_eq!(diagnostics[0].range.start.line, 0);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore]
+    fn rust_analyzer_renames_across_files() {
+        let dir = std::env::temp_dir().join(format!("forge-lsp-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"renamer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        let lib = "mod util;\npub fn run() -> i32 {\n    util::compute() + util::compute()\n}\n";
+        let util = "pub fn compute() -> i32 {\n    1\n}\n";
+        std::fs::write(dir.join("src/lib.rs"), lib).unwrap();
+        std::fs::write(dir.join("src/util.rs"), util).unwrap();
+        let (events, _receiver) = flume::unbounded();
+        let server = Server::start(Kind::Rust, &dir, events);
+        let (lib_uri, util_uri) = (path_to_uri(&dir.join("src/lib.rs")), path_to_uri(&dir.join("src/util.rs")));
+        server.sync(&lib_uri, "rust", false, &Rope::from(lib));
+        server.sync(&util_uri, "rust", false, &Rope::from(util));
+        let position = json!({ "line": 2, "character": 12 });
+        let mut edit = None;
+        for _ in 0..60 {
+            let reply = server.request(
+                "textDocument/rename",
+                json!({ "textDocument": { "uri": lib_uri }, "position": position, "newName": "calculate" }),
+            );
+            if let Ok(Ok(value)) = reply.recv_timeout(Duration::from_secs(30)) {
+                if !value.is_null() {
+                    edit = serde_json::from_value::<lsp_types::WorkspaceEdit>(value).ok();
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        let plan = crate::rename::plan(edit.expect("rust-analyzer returned no rename edit"));
+        assert_eq!(plan.files.len(), 2);
+        for file in &plan.files {
+            let text = std::fs::read_to_string(&file.path).unwrap();
+            let applied = crate::rename::apply(&text, &file.edits, 0).unwrap();
+            assert!(!applied.text.contains("compute"), "{}", applied.text);
+            assert!(applied.text.contains("calculate"));
+        }
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

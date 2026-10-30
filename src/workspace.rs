@@ -20,6 +20,7 @@ use gpui_kit::{
 use crate::file_icons;
 use crate::build::BuildAction;
 use crate::clone_dialog::{CloneDialog, CloneEvent};
+use crate::rename::{self, RenameDialog, RenameEvent};
 use crate::build_panel::{self, BuildEvent, BuildPanel};
 use crate::files::{self, Node, Row};
 use crate::git::{self, FileStatus, RepoState, TreeMarks};
@@ -69,6 +70,11 @@ enum Drag {
     Left,
     Right,
     Bottom,
+}
+
+struct RenameTarget {
+    doc_id: usize,
+    offset: usize,
 }
 
 struct Document {
@@ -135,11 +141,15 @@ pub struct Workspace {
     selected_change: Option<(bool, PathBuf)>,
     commit_input: Entity<InputState>,
     clone: Entity<CloneDialog>,
+    rename: Entity<RenameDialog>,
+    rename_task: Option<Task<()>>,
+    rename_target: Option<RenameTarget>,
     notice: Option<Notice>,
     notice_task: Option<Task<()>>,
     format_task: Option<Task<()>>,
     reload_task: Option<Task<()>>,
     tree_task: Option<Task<()>>,
+    reveal_task: Option<Task<()>>,
     index: Option<Arc<FileIndex>>,
     index_task: Option<Task<()>>,
     cache_task: Option<Task<()>>,
@@ -193,6 +203,15 @@ impl Workspace {
             }
         }));
         subscriptions.push(cx.observe(&clone, |_, _, cx| cx.notify()));
+        let rename = cx.new(|cx| RenameDialog::new(window, cx));
+        subscriptions.push(cx.subscribe_in(&rename, window, |this, _, event, window, cx| match event {
+            RenameEvent::Dismissed => {
+                this.rename_target = None;
+                this.focus_active_editor(window, cx);
+            }
+            RenameEvent::Submit(name) => this.run_rename(name.clone(), window, cx),
+        }));
+        subscriptions.push(cx.observe(&rename, |_, _, cx| cx.notify()));
         let search = cx.new(|cx| SearchPanel::new(window, cx));
         subscriptions.push(cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
             SearchEvent::Open { path, line, column } => this.open_at(path, *line, *column, window, cx),
@@ -290,11 +309,15 @@ impl Workspace {
             selected_change: None,
             commit_input,
             clone,
+            rename,
+            rename_task: None,
+            rename_target: None,
             notice: None,
             notice_task: None,
             format_task: None,
             reload_task: None,
             tree_task: None,
+            reveal_task: None,
             index: None,
             index_task: None,
             cache_task: None,
@@ -788,6 +811,176 @@ impl Workspace {
         }));
     }
 
+    pub fn rename_symbol(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename.read(cx).is_open() || self.rename_task.is_some() {
+            return;
+        }
+        let Some(doc) = self.active_doc() else { return };
+        if self.lsp.is_external(&doc.path) {
+            self.notify_info("Rename isn't available for files outside the project", cx);
+            return;
+        }
+        let Some(definitions) = doc.definitions.clone().filter(|d| d.can_rename()) else {
+            let language = doc.definitions.as_ref().map_or_else(|| files::language_for(&doc.path), |d| d.language);
+            let message = format!("Rename isn't available for {language}");
+            self.notify_info(message, cx);
+            return;
+        };
+        let ids: Vec<usize> = self.docs.iter().map(|d| d.id).collect();
+        for id in ids {
+            self.sync_lsp(id, cx);
+        }
+        let Some(doc) = self.active_doc() else { return };
+        let id = doc.id;
+        let (text, offset) = {
+            let state = doc.editor.read(cx);
+            (state.text().clone(), state.cursor())
+        };
+        let Some(prepare) = definitions.prepare_rename(&text, offset, cx) else { return };
+        let kind = definitions.kind;
+        let indexing = format!("{} is still indexing the project; try again shortly", kind.map_or("The language server", |k| k.server_name()));
+        self.rename_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = prepare.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.rename_task = None;
+                if this.active_doc().map(|d| d.id) != Some(id) {
+                    return;
+                }
+                let target = match result {
+                    Ok(lsp::PrepareOutcome::Target(target)) => {
+                        let at = text.position_to_offset(&target.range.start);
+                        Some((target.placeholder, at))
+                    }
+                    Ok(lsp::PrepareOutcome::Nothing) => None,
+                    Ok(lsp::PrepareOutcome::Unsupported) => {
+                        let at = text.offset_to_position(offset);
+                        let line = lsp::line_text(&text, at.line);
+                        crate::builtin_lang::word_at(&line, at.character as usize).map(|(word, _)| (word, offset))
+                    }
+                    Err(err) if matches!(err.downcast_ref(), Some(lsp::ServerError::Busy)) => {
+                        this.notify_info(indexing, cx);
+                        return;
+                    }
+                    Err(err) => {
+                        this.notify_error(err.to_string(), cx);
+                        return;
+                    }
+                };
+                match target {
+                    Some((name, at)) => {
+                        this.rename_target = Some(RenameTarget { doc_id: id, offset: at });
+                        this.rename.update(cx, |dialog, cx| dialog.show(&name, window, cx));
+                    }
+                    None => this.notify_info("There is no symbol to rename here", cx),
+                }
+            });
+        }));
+    }
+
+    fn run_rename(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.rename_target.take() else { return };
+        let Some(doc) = self.docs.iter().find(|d| d.id == target.doc_id) else { return };
+        let Some(definitions) = doc.definitions.clone() else { return };
+        let text = doc.editor.read(cx).text().clone();
+        let Some(request) = definitions.rename(&text, target.offset, name, cx) else { return };
+        self.focus_active_editor(window, cx);
+        self.notify_info("Renaming…", cx);
+        self.rename_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = request.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.rename_task = None;
+                match result {
+                    Ok(Some(edit)) => this.apply_rename(rename::plan(edit), window, cx),
+                    Ok(None) => this.notify_info("The language server made no changes", cx),
+                    Err(err) if matches!(err.downcast_ref(), Some(lsp::ServerError::Busy)) => {
+                        this.notify_info("The project changed while renaming; try again", cx)
+                    }
+                    Err(err) => this.notify_error(format!("Rename failed: {err}"), cx),
+                }
+            });
+        }));
+    }
+
+    fn apply_rename(&mut self, plan: rename::EditPlan, window: &mut Window, cx: &mut Context<Self>) {
+        let mut skipped = plan.skipped_operations;
+        let mut errors: Vec<String> = Vec::new();
+        let (mut files_done, mut edits_done) = (0usize, 0usize);
+        let mut background = Vec::new();
+        for file in plan.files {
+            if !rename::within(self.root.as_deref(), &file.path) {
+                skipped += 1;
+                continue;
+            }
+            let Some(ix) = self.docs.iter().position(|d| d.path == file.path) else {
+                background.push(file);
+                continue;
+            };
+            let editor = self.docs[ix].editor.clone();
+            let (text, cursor, scroll) = {
+                let state = editor.read(cx);
+                (state.text().to_string(), state.cursor(), state.scroll_offset())
+            };
+            match rename::apply(&text, &file.edits, cursor) {
+                Ok(applied) => {
+                    editor.update(cx, |state, cx| {
+                        state.replace_all(applied.text, window, cx);
+                        state.set_cursor_position(applied.cursor, window, cx);
+                        state.set_scroll_offset(scroll, cx);
+                    });
+                    files_done += 1;
+                    edits_done += file.edits.len();
+                }
+                Err(err) => errors.push(format!("{}: {err}", file.path.display())),
+            }
+        }
+        self.focus_active_editor(window, cx);
+        if background.is_empty() {
+            self.finish_rename(files_done, edits_done, skipped, errors, cx);
+            return;
+        }
+        let work = cx.background_spawn(async move {
+            let mut done = (0usize, 0usize);
+            let mut errors = Vec::new();
+            for file in background {
+                let outcome = document::load_text(&file.path).and_then(|loaded| {
+                    let applied = rename::apply(&loaded.text, &file.edits, 0)?;
+                    files::write_atomic(&file.path, applied.text.as_bytes()).map_err(|err| err.to_string())
+                });
+                match outcome {
+                    Ok(()) => {
+                        done.0 += 1;
+                        done.1 += file.edits.len();
+                    }
+                    Err(err) => errors.push(format!("{}: {err}", file.path.display())),
+                }
+            }
+            (done, errors)
+        });
+        self.rename_task = Some(cx.spawn(async move |this, cx| {
+            let ((files, edits), more) = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.rename_task = None;
+                errors.extend(more);
+                this.schedule_git_refresh(cx);
+                this.finish_rename(files_done + files, edits_done + edits, skipped, errors, cx);
+            });
+        }));
+    }
+
+    fn finish_rename(&mut self, files: usize, edits: usize, skipped: usize, errors: Vec<String>, cx: &mut Context<Self>) {
+        if let Some(first) = errors.first() {
+            let more = if errors.len() > 1 { format!(" (+{} more)", errors.len() - 1) } else { String::new() };
+            self.notify_error(format!("Rename incomplete, {first}{more}"), cx);
+            return;
+        }
+        let plural = |n: usize, word: &str| if n == 1 { format!("{n} {word}") } else { format!("{n} {word}s") };
+        let mut message = format!("Renamed {} in {}", plural(edits, "occurrence"), plural(files, "file"));
+        if skipped > 0 {
+            message.push_str(&format!("; skipped {skipped} outside the project or not text edits"));
+        }
+        self.notify_info(message, cx);
+    }
+
     pub fn step_history(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
         let target = if back { self.back.pop() } else { self.forward.pop() };
         let Some(target) = target else { return };
@@ -807,7 +1000,47 @@ impl Workspace {
         let editor = self.docs[ix].editor.clone();
         editor.update(cx, |state, cx| state.focus(window, cx));
         self.sync_lsp(self.docs[ix].id, cx);
+        self.auto_reveal(cx);
         cx.notify();
+    }
+
+    fn auto_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.active_doc().map(|d| d.path.clone()) else { return };
+        let Some(tree) = self.tree.as_mut() else { return };
+        if !path.starts_with(&tree.path) {
+            return;
+        }
+        let missing = tree.unloaded_ancestors(&path);
+        if missing.is_empty() {
+            tree.reveal_with(&path, &mut Default::default());
+            self.finish_reveal(&path);
+            return;
+        }
+        self.reveal_task = Some(cx.spawn(async move |this, cx| {
+            let mut listings = cx
+                .background_spawn(async move {
+                    missing.into_iter().map(|dir| { let list = files::list_dir(&dir); (dir, list) }).collect::<std::collections::HashMap<_, _>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.reveal_task = None;
+                if this.active_doc().map(|d| &d.path) != Some(&path) {
+                    return;
+                }
+                if let Some(tree) = this.tree.as_mut() {
+                    tree.reveal_with(&path, &mut listings);
+                    this.finish_reveal(&path);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn finish_reveal(&mut self, path: &Path) {
+        self.rebuild_rows();
+        if let Some(ix) = self.rows.iter().position(|row| &row.path == path) {
+            self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        }
     }
 
     pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2158,6 +2391,16 @@ impl Workspace {
                         }))
                         .child(
                             Editor::new(&doc.editor)
+                                .context_menu(|menu, _, _| {
+                                    use gpui_kit::component::input::{Copy, Cut, GoToDefinition, Paste, SelectAll};
+                                    menu.menu("Go to Definition", Box::new(GoToDefinition))
+                                        .menu("Rename Symbol…", Box::new(crate::RenameSymbol))
+                                        .separator()
+                                        .menu("Cut", Box::new(Cut))
+                                        .menu("Copy", Box::new(Copy))
+                                        .menu("Paste", Box::new(Paste))
+                                        .menu("Select All", Box::new(SelectAll))
+                                })
                                 .bordered(false)
                                 .appearance(false)
                                 .text_size(px(Settings::get(cx).editor_font_size))
@@ -2828,6 +3071,7 @@ impl Render for Workspace {
                 )
             })
             .when(self.clone.read(cx).is_open(), |el| el.child(self.clone.clone()))
+            .when(self.rename.read(cx).is_open(), |el| el.child(self.rename.clone()))
             .when(self.quick_open_visible, |el| {
                 el.child(
                     div()
