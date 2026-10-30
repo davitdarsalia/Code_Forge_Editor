@@ -29,6 +29,8 @@ use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::recent;
 use crate::index_cache;
 use crate::lsp;
+use crate::diagnostics;
+use crate::issues_panel;
 use crate::search::{FileIndex, IndexProgress};
 use crate::settings::Settings;
 use crate::search_panel::{SearchEvent, SearchPanel};
@@ -45,6 +47,7 @@ const INDEX_TICK: Duration = Duration::from_millis(80);
 const INDEX_BAR_DELAY: Duration = Duration::from_millis(120);
 const MAX_LOG_LINES: usize = 200;
 const MAX_HISTORY: usize = 100;
+const LSP_SYNC_DELAY: Duration = Duration::from_millis(250);
 
 struct Indexing {
     progress: Arc<IndexProgress>,
@@ -106,6 +109,7 @@ enum Navigator {
 enum BottomTab {
     Terminal,
     Build,
+    Issues,
 }
 
 #[derive(Clone)]
@@ -168,6 +172,9 @@ pub struct Workspace {
     soft_wrap: bool,
     lsp: Rc<lsp::Manager>,
     definition_task: Option<Task<()>>,
+    issues: diagnostics::Store,
+    lsp_sync: std::collections::HashMap<usize, Task<()>>,
+    _lsp_events: Task<()>,
     back: Vec<NavPoint>,
     forward: Vec<NavPoint>,
     _subscriptions: Vec<Subscription>,
@@ -341,6 +348,16 @@ impl Workspace {
             async {}
         }));
 
+        let lsp = Rc::new(lsp::Manager::default());
+        let events = lsp.events();
+        let lsp_events = cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv_async().await {
+                if this.update(cx, |this, cx| this.on_lsp_event(event, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+
         crate::startup::mark("Workspace::new children built");
         Workspace {
             root: None,
@@ -394,8 +411,11 @@ impl Workspace {
             focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
             soft_wrap: Settings::get(cx).soft_wrap,
-            lsp: Rc::default(),
+            lsp,
             definition_task: None,
+            issues: diagnostics::Store::default(),
+            lsp_sync: std::collections::HashMap::new(),
+            _lsp_events: lsp_events,
             back: Vec::new(),
             forward: Vec::new(),
             _subscriptions: subscriptions,
@@ -433,6 +453,8 @@ impl Workspace {
         self.back.clear();
         self.forward.clear();
         self.lsp.set_project(Some(root.clone()));
+        self.issues.clear();
+        self.lsp_sync.clear();
         self.repo = None;
         self.git_marks = Rc::default();
         self.terminal = None;
@@ -703,6 +725,7 @@ impl Workspace {
                 if let Some(definitions) = this.docs.iter().find(|d| d.id == id).and_then(|d| d.definitions.as_ref()) {
                     definitions.stale.set(true);
                 }
+                this.schedule_lsp_sync(id, cx);
                 this.schedule_save(id, cx);
                 this.schedule_preview(id, window, cx);
             }
@@ -713,6 +736,7 @@ impl Workspace {
             }
             _ => {}
         });
+        self.issues.attach(path, &editor, cx);
         self.docs.push(Document {
             id,
             path: path.to_path_buf(),
@@ -858,6 +882,7 @@ impl Workspace {
         self.active = Some(ix);
         let editor = self.docs[ix].editor.clone();
         editor.update(cx, |state, cx| state.focus(window, cx));
+        self.sync_lsp(self.docs[ix].id, cx);
         self.refresh_preview(window, cx);
         cx.notify();
     }
@@ -892,6 +917,8 @@ impl Workspace {
         let Some(ix) = self.docs.iter().position(|d| d.id == id) else { return };
         let doc = self.docs.remove(ix);
         self.lsp.close(&doc.path);
+        self.lsp_sync.remove(&id);
+        self.issues.forget(&doc.path);
         self.active = if self.docs.is_empty() { None } else { Some(ix.min(self.docs.len() - 1)) };
         if let Some(ix) = self.active {
             self.activate(ix, window, cx);
@@ -972,6 +999,7 @@ impl Workspace {
         }
         doc.applied_seq = seq;
         let current = doc.edit_gen == edit_gen;
+        let written = matches!(outcome, SaveOutcome::Written { .. }).then(|| doc.path.clone());
         let saved = match outcome {
             SaveOutcome::Unchanged => {
                 if doc.dirty && current {
@@ -1010,6 +1038,10 @@ impl Workspace {
                 false
             }
         };
+        if let Some(path) = written {
+            self.sync_lsp(id, cx);
+            self.lsp.saved(&path);
+        }
         cx.notify();
         saved
     }
@@ -1051,6 +1083,7 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.reload_task = None;
+                let mut reloaded = Vec::new();
                 for (id, current, hash, text) in changes {
                     let Some(doc) = this.docs.iter_mut().find(|d| d.id == id) else { continue };
                     if doc.dirty || doc.saving {
@@ -1060,6 +1093,13 @@ impl Workspace {
                     let Some(text) = text else { continue };
                     doc.saved_hash = hash;
                     doc.editor.update(cx, |state, cx| state.set_value(text, window, cx));
+                    if let Some(definitions) = doc.definitions.as_ref() {
+                        definitions.stale.set(true);
+                        reloaded.push(id);
+                    }
+                }
+                for id in reloaded {
+                    this.schedule_lsp_sync(id, cx);
                 }
                 this.refresh_preview(window, cx);
                 cx.notify();
@@ -1513,6 +1553,65 @@ impl Workspace {
         for doc in &self.docs {
             doc.editor.update(cx, |state, cx| state.set_soft_wrap(soft_wrap, window, cx));
         }
+    }
+
+    fn schedule_lsp_sync(&mut self, id: usize, cx: &mut Context<Self>) {
+        if !self.docs.iter().any(|d| d.id == id && d.definitions.is_some()) {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LSP_SYNC_DELAY).await;
+            let _ = this.update(cx, |this, cx| this.sync_lsp(id, cx));
+        });
+        self.lsp_sync.insert(id, task);
+    }
+
+    fn sync_lsp(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.lsp_sync.remove(&id);
+        let Some(doc) = self.docs.iter().find(|d| d.id == id) else { return };
+        let Some(definitions) = doc.definitions.as_ref() else { return };
+        if self.lsp.is_external(&doc.path) {
+            return;
+        }
+        let (kind, path, stale) = (definitions.kind, doc.path.clone(), definitions.stale.replace(false));
+        let text = doc.editor.read(cx).text().clone();
+        self.lsp.sync(kind, &path, stale, &text, cx);
+    }
+
+    fn on_lsp_event(&mut self, event: lsp::Event, cx: &mut Context<Self>) {
+        match event {
+            lsp::Event::Diagnostics { path, diagnostics } => {
+                if self.root.is_none() || self.lsp.is_external(&path) {
+                    return;
+                }
+                let editor = self.docs.iter().find(|d| d.path == path).map(|d| d.editor.clone());
+                self.issues.publish(path, diagnostics, editor.as_ref(), cx);
+                cx.notify();
+            }
+            lsp::Event::Stopped { kind, reason, spawn_failed } => {
+                if let Some(message) = self.lsp.stopped(kind, reason, spawn_failed) {
+                    self.notify_error(message, cx);
+                }
+            }
+        }
+    }
+
+    pub fn show_issues(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_terminal && self.bottom_tab == BottomTab::Issues {
+            self.toggle_terminal(window, cx);
+            return;
+        }
+        self.show_terminal = true;
+        self.bottom_tab = BottomTab::Issues;
+        cx.notify();
+    }
+
+    fn issues_open_handler(&self, cx: &mut Context<Self>) -> issues_panel::OpenHandler {
+        let workspace = cx.weak_entity();
+        Rc::new(move |path, line, column, window, cx| {
+            let path = path.to_path_buf();
+            let _ = workspace.update(cx, |ws, cx| ws.open_at(&path, line, column, window, cx));
+        })
     }
 
     fn notify_info(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -2163,13 +2262,18 @@ impl Workspace {
                         .flex_1()
                         .min_w(px(0.))
                         .h_full()
+                        .relative()
                         .child(
                             Editor::new(&doc.editor)
                                 .bordered(false)
                                 .appearance(false)
                                 .text_size(px(Settings::get(cx).editor_font_size))
                                 .h_full(),
-                        ),
+                        )
+                        .when_some(self.issues.marks(&doc.path), |el, marks| {
+                            let size = px((Settings::get(cx).editor_font_size * 0.9).round());
+                            el.child(diagnostics::overlay(doc.editor.clone(), marks, size))
+                        }),
                 )
                 .when(self.preview_open(), |el| {
                     el.child(drag_handle("handle-preview", Drag::Preview, cx))
@@ -2226,8 +2330,13 @@ impl Workspace {
                     .border_b_1()
                     .border_color(Palette::border())
                     .bg(Palette::sidebar_bg())
-                    .child(self.bottom_tab_button("bottom-terminal", IconName::SquareTerminal, "Terminal", BottomTab::Terminal, cx))
-                    .child(self.bottom_tab_button("bottom-build", IconName::Hammer, "Build", BottomTab::Build, cx))
+                    .child(self.bottom_tab_button("bottom-terminal", IconName::SquareTerminal, "Terminal", BottomTab::Terminal, None, cx))
+                    .child(self.bottom_tab_button("bottom-build", IconName::Hammer, "Build", BottomTab::Build, None, cx))
+                    .child({
+                        let (errors, warnings) = self.issues.counts();
+                        let badge = (errors + warnings > 0).then(|| issues_panel::counts_badge(errors, warnings));
+                        self.bottom_tab_button("bottom-issues", IconName::TriangleAlert, "Issues", BottomTab::Issues, badge, cx)
+                    })
                     .child(div().flex_1())
                     .when(self.bottom_tab == BottomTab::Terminal, |el| {
                         el.child(tool_button("term-restart", IconName::RotateCw, false, cx.listener(
@@ -2245,6 +2354,11 @@ impl Workspace {
                     .map(|el| match self.bottom_tab {
                         BottomTab::Terminal => el.when_some(self.terminal.clone(), |el, terminal| el.child(terminal)),
                         BottomTab::Build => el.child(self.build.clone()),
+                        BottomTab::Issues => el.child(issues_panel::render(
+                            &self.issues,
+                            self.root.as_deref(),
+                            self.issues_open_handler(cx),
+                        )),
                     }),
             )
     }
@@ -2255,6 +2369,7 @@ impl Workspace {
         name: IconName,
         label: &'static str,
         tab: BottomTab,
+        badge: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = self.bottom_tab == tab;
@@ -2272,6 +2387,7 @@ impl Workspace {
             .hover(|s| s.bg(ca(0xffffff, 0.06)))
             .child(icon(name, 13., color))
             .child(div().text_size(px(11.5)).text_color(color).child(label))
+            .when_some(badge, |el, badge| el.child(div().ml(px(2.)).child(badge)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.bottom_tab = tab;
                 if tab == BottomTab::Terminal {
@@ -2524,6 +2640,19 @@ impl Workspace {
                 )
             })
             .child(index_status)
+            .when(!self.issues.is_empty(), |el| {
+                let (errors, warnings) = self.issues.counts();
+                el.child(
+                    div()
+                        .id("status-issues")
+                        .px(px(4.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(ca(0xffffff, 0.06)))
+                        .child(issues_panel::counts_badge(errors, warnings))
+                        .on_click(cx.listener(|this, _, window, cx| this.show_issues(window, cx))),
+                )
+            })
             .child(div().flex_1())
             .when_some(cursor, |el, cursor| {
                 el.child(format!("Ln {}, Col {}", cursor.line + 1, cursor.character + 1))
