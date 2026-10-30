@@ -108,6 +108,10 @@ impl BuildAction {
     }
 }
 
+pub fn is_skipped_dir(name: &str) -> bool {
+    SKIP_DIRS.contains(&name)
+}
+
 pub fn detect(root: &Path) -> Vec<BuildProject> {
     let mut found = Vec::new();
     walk(root, 0, &mut found);

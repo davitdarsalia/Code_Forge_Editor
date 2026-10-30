@@ -14,7 +14,7 @@ use crate::build::{
     self, BuildAction, BuildProject, Destination, Issue, IssueSet, ModuleKind, ProjectKind, RunEvent, RunHandle,
     Severity,
 };
-use crate::file_icons;
+use crate::{file_icons, xcode_lsp};
 use crate::theme::{mono_font, Palette, ca};
 
 const MAX_LOG_LINES: usize = 20_000;
@@ -25,6 +25,8 @@ const ISSUE_ROW_HEIGHT: f32 = 24.;
 pub enum BuildEvent {
     Open { path: PathBuf, line: u32, column: u32 },
     Started,
+    Notice(SharedString),
+    SwiftSettingsChanged,
 }
 
 #[derive(Clone, PartialEq)]
@@ -64,6 +66,9 @@ pub struct BuildPanel {
     detect_task: Option<Task<()>>,
     scheme_tasks: Vec<Task<()>>,
     sim_task: Option<Task<()>>,
+    swift_task: Option<Task<()>>,
+    swift_setup: Option<xcode_lsp::Setup>,
+    swift_noticed: bool,
 }
 
 impl EventEmitter<BuildEvent> for BuildPanel {}
@@ -100,6 +105,9 @@ impl BuildPanel {
             detect_task: None,
             scheme_tasks: Vec::new(),
             sim_task: None,
+            swift_task: None,
+            swift_setup: None,
+            swift_noticed: false,
         }
     }
 
@@ -110,6 +118,9 @@ impl BuildPanel {
         self.selected = None;
         self.picker_open = false;
         self.scheme_tasks.clear();
+        self.swift_task = None;
+        self.swift_setup = None;
+        self.swift_noticed = false;
         self.state = RunState::Idle;
         self.detecting = true;
         let scan_root = root.clone();
@@ -160,10 +171,53 @@ impl BuildPanel {
                     if this.selected.as_ref().is_some_and(|(p, unit)| *p == ix && unit.is_none()) {
                         this.selected = Some((ix, preferred_unit(&this.projects[ix])));
                     }
+                    if this.selected.as_ref().is_some_and(|(p, _)| *p == ix) {
+                        this.prepare_swift(false, cx);
+                    }
                     cx.notify();
                 });
             }));
         }
+    }
+
+    fn prepare_swift(&mut self, rebind: bool, cx: &mut Context<Self>) {
+        let Some((project, unit)) = self.selected_project() else { return };
+        let ProjectKind::Xcode { container, .. } = &project.kind else { return };
+        let Some(target) = xcode_lsp::Target::new(project.dir.clone(), container, unit.map(str::to_owned)) else {
+            return;
+        };
+        let Some(root) = self.root.clone() else { return };
+        let task = cx.background_spawn(async move { xcode_lsp::prepare(&target, rebind) });
+        self.swift_task = Some(cx.spawn(async move |this, cx| {
+            let prepared = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.root.as_ref() == Some(&root) {
+                    this.swift_prepared(prepared, cx);
+                }
+            });
+        }));
+    }
+
+    fn swift_prepared(&mut self, prepared: xcode_lsp::Prepared, cx: &mut Context<Self>) {
+        let became_ready =
+            prepared.setup == xcode_lsp::Setup::Ready && self.swift_setup == Some(xcode_lsp::Setup::NeedsBuild);
+        if prepared.changed || became_ready {
+            cx.emit(BuildEvent::SwiftSettingsChanged);
+        }
+        let notice = match &prepared.setup {
+            xcode_lsp::Setup::NeedsBuild => Some(xcode_lsp::NEEDS_BUILD_NOTICE),
+            xcode_lsp::Setup::MissingTool => Some(xcode_lsp::MISSING_TOOL_NOTICE),
+            xcode_lsp::Setup::Failed(reason) => {
+                eprintln!("forge: Swift build server setup failed: {reason}");
+                None
+            }
+            xcode_lsp::Setup::Ready => None,
+        };
+        if let Some(notice) = notice.filter(|_| !self.swift_noticed) {
+            self.swift_noticed = true;
+            cx.emit(BuildEvent::Notice(notice.into()));
+        }
+        self.swift_setup = Some(prepared.setup);
     }
 
     fn refresh_simulators(&mut self, cx: &mut Context<Self>) {
@@ -292,7 +346,7 @@ impl BuildPanel {
                 batch.extend(rx.drain());
                 let alive = this.update(cx, |this, cx| {
                     for event in batch {
-                        this.handle_event(event, action);
+                        this.handle_event(event, action, cx);
                     }
                     cx.notify();
                 });
@@ -304,7 +358,7 @@ impl BuildPanel {
         cx.notify();
     }
 
-    fn handle_event(&mut self, event: RunEvent, action: BuildAction) {
+    fn handle_event(&mut self, event: RunEvent, action: BuildAction, cx: &mut Context<Self>) {
         let follow = self.scroll.is_scrolled_to_end().unwrap_or(true);
         match event {
             RunEvent::Line(text, issue) => {
@@ -333,6 +387,9 @@ impl BuildPanel {
                 self.push_line(tail.into());
                 if !matches!(self.state, RunState::Done { success: true, .. }) && self.errors > 0 {
                     self.view = View::Issues;
+                }
+                if action == BuildAction::Build && !self.stopping {
+                    self.prepare_swift(true, cx);
                 }
             }
             RunEvent::Failed(message) => {

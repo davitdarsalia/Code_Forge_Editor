@@ -224,6 +224,8 @@ impl Workspace {
                 this.bottom_tab = BottomTab::Build;
                 cx.notify();
             }
+            BuildEvent::Notice(message) => this.notify_info(message.clone(), cx),
+            BuildEvent::SwiftSettingsChanged => this.lsp.restart(lsp::Kind::Swift, cx),
         }));
         subscriptions.push(cx.observe(&build, |_, _, cx| cx.notify()));
         let quick_open = cx.new(|cx| QuickOpen::new(window, cx));

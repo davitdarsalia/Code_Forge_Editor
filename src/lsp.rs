@@ -14,8 +14,8 @@ use gpui_kit::{App, Task, Window};
 use lsp_types::{GotoDefinitionResponse, LocationLink, Position, PublishDiagnosticsParams, Range};
 use serde_json::{Value, json};
 
-use crate::builtin_lang;
 use crate::tools::{self, xcrun_find};
+use crate::{builtin_lang, xcode_lsp};
 
 const IDLE_SHUTDOWN: Duration = Duration::from_secs(10 * 60);
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -228,9 +228,10 @@ const SPECS: &[Spec] = &[
         languages: &["swift"],
         server_name: "sourcekit-lsp",
         language_id: |_, _| "swift",
-        markers: &["Package.swift"],
+        markers: &["Package.swift", xcode_lsp::CONFIG_FILE],
         binary: "sourcekit-lsp",
         xcrun: true,
+        init_options: xcode_lsp::sourcekit_options,
         missing: "sourcekit-lsp not found: install Xcode or a Swift toolchain",
         ..BASE
     },
@@ -468,7 +469,13 @@ fn root_for(kind: Kind, project: &Path, path: &Path) -> Option<PathBuf> {
         .take_while(|dir| dir.starts_with(project))
         .filter(|dir| kind.has_marker(dir));
     let found = if kind.spec().prefers_topmost { manifests.last() } else { manifests.next() };
-    Some(found.unwrap_or(project).to_path_buf())
+    let root = found.unwrap_or(project).to_path_buf();
+    if kind == Kind::Swift {
+        if let Some(tests) = xcode_lsp::test_root(&root, path) {
+            return Some(tests);
+        }
+    }
+    Some(root)
 }
 
 pub fn path_to_uri(path: &Path) -> String {
@@ -760,11 +767,17 @@ fn read_loop(shared: &Shared, stdout: ChildStdout) {
     shared.finish();
 }
 
+struct OpenDoc {
+    version: i32,
+    language_id: &'static str,
+    text: Rope,
+}
+
 pub struct Server {
     kind: Kind,
     shared: Arc<Shared>,
     outgoing: flume::Sender<Outgoing>,
-    open: RefCell<HashMap<String, i32>>,
+    open: RefCell<HashMap<String, OpenDoc>>,
     last_used: Cell<Instant>,
     child: Arc<Mutex<Option<Child>>>,
 }
@@ -835,7 +848,7 @@ impl Server {
         let uri_owned = uri.to_owned();
         match open.get_mut(uri) {
             None => {
-                open.insert(uri.to_owned(), 1);
+                open.insert(uri.to_owned(), OpenDoc { version: 1, language_id, text: text.clone() });
                 self.notify_with("textDocument/didOpen", move || {
                     json!({ "textDocument": {
                         "uri": uri_owned, "languageId": language_id, "version": 1, "text": text.to_string(),
@@ -844,9 +857,10 @@ impl Server {
                 self.pull(uri);
                 self.warm(uri, &text_for_warm);
             }
-            Some(version) if stale => {
-                *version += 1;
-                let version = *version;
+            Some(doc) if stale => {
+                doc.version += 1;
+                doc.text = text.clone();
+                let version = doc.version;
                 self.notify_with("textDocument/didChange", move || {
                     json!({
                         "textDocument": { "uri": uri_owned, "version": version },
@@ -868,6 +882,10 @@ impl Server {
             "textDocument/definition",
             json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }),
         );
+    }
+
+    fn open_docs(&self) -> Vec<(String, &'static str, Rope)> {
+        self.open.borrow().iter().map(|(uri, doc)| (uri.clone(), doc.language_id, doc.text.clone())).collect()
     }
 
     fn saved(&self, uri: &str) {
@@ -1213,6 +1231,26 @@ impl Manager {
             }
         }
         self.noticed.borrow_mut().insert(kind).then_some(reason)
+    }
+
+    pub fn restart(self: &Rc<Self>, kind: Kind, cx: &mut App) {
+        let old: Vec<Rc<Server>> =
+            self.servers.borrow_mut().extract_if(|(k, _), _| *k == kind).map(|(_, server)| server).collect();
+        self.last_root.borrow_mut().remove(&kind);
+        self.crashes.borrow_mut().remove(&kind);
+        self.noticed.borrow_mut().remove(&kind);
+        let docs: Vec<(String, &'static str, Rope)> = old.iter().flat_map(|server| server.open_docs()).collect();
+        drop(old);
+        if self.failed.borrow().contains_key(&kind) {
+            return;
+        }
+        for (uri, language_id, text) in docs {
+            let Some(path) = uri_to_path(&uri) else { continue };
+            match self.server(kind, &path, cx) {
+                Ok(server) => server.sync(&uri, language_id, false, &text),
+                Err(reason) => eprintln!("forge: cannot restart {}: {reason}", kind.server_name()),
+            }
+        }
     }
 
     pub fn indexing(&self, kind: Kind) -> bool {
@@ -1767,6 +1805,76 @@ mod tests {
         assert_eq!(diagnostics[0].range.start.line, 0);
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn latest_diagnostics(receiver: &flume::Receiver<Event>, seen: &mut HashMap<PathBuf, Vec<lsp_types::Diagnostic>>) {
+        while let Ok(event) = receiver.try_recv() {
+            if let Event::Diagnostics { path, diagnostics } = event {
+                seen.insert(path, diagnostics);
+            }
+        }
+    }
+
+    fn find_column(text: &str, line: u32, needle: &str) -> u32 {
+        let content = text.lines().nth(line as usize).unwrap();
+        utf16_column(content, content[..content.find(needle).unwrap()].chars().count() as u32) + 1
+    }
+
+    #[test]
+    #[ignore]
+    fn sourcekit_checks_real_xcode_project() {
+        let project = PathBuf::from(std::env::var("FORGE_XCODE_PROJECT_DIR").expect("set FORGE_XCODE_PROJECT_DIR"));
+        let settle = Duration::from_secs(std::env::var("FORGE_TEST_SETTLE").ok().and_then(|v| v.parse().ok()).unwrap_or(40));
+        let same = project.join("DMote/Screens/Settings/Components/SettingsRemoteBehaviourSection.swift");
+        let typo = project.join("DMote/Domain/UpdateStatus.swift");
+        let xctest = project.join("UITests/UITests.swift");
+        let (events, receiver) = flume::unbounded();
+        let mut servers: HashMap<PathBuf, Server> = HashMap::new();
+        let mut texts = HashMap::new();
+        for file in [&same, &typo, &xctest] {
+            let root = root_for(Kind::Swift, &project, file).unwrap();
+            eprintln!("{} -> root {}", file.display(), root.display());
+            let text = std::fs::read_to_string(file).unwrap();
+            let server = servers.entry(root.clone()).or_insert_with(|| Server::start(Kind::Swift, &root, events.clone()));
+            server.sync(&path_to_uri(file), "swift", false, &Rope::from(text.as_str()));
+            texts.insert(file.clone(), (root, text));
+        }
+        std::thread::sleep(settle);
+        let server_for = |file: &PathBuf| &servers[&texts[file].0];
+
+        let text = &texts[&same].1;
+        let use_line = text.lines().position(|l| l.contains("if visibility.shows(.keepScreenAwake)")).unwrap() as u32;
+        let column = find_column(text, use_line, "visibility");
+        let (_, links) = timed_definition(server_for(&same), &path_to_uri(&same), use_line, column);
+        eprintln!("same-file local: {links:?}");
+        let decl_line = text.lines().position(|l| l.contains("let visibility =")).unwrap() as u32;
+        assert!(links.iter().any(|l| l.target_uri.as_str().ends_with("SettingsRemoteBehaviourSection.swift") && l.target_range.start.line == decl_line));
+
+        let store_line = text.lines().position(|l| l.contains("RemoteConfigStore")).unwrap() as u32;
+        let column = find_column(text, store_line, "RemoteConfigStore");
+        let (_, links) = timed_definition(server_for(&same), &path_to_uri(&same), store_line, column);
+        eprintln!("cross-file type: {links:?}");
+        assert!(links.iter().any(|l| l.target_uri.as_str().ends_with("RemoteConfigStore.swift")));
+
+        let mut seen = HashMap::new();
+        latest_diagnostics(&receiver, &mut seen);
+        eprintln!("UITests diagnostics: {:?}", seen.get(&xctest).map(|d| d.iter().map(|d| d.message.clone()).collect::<Vec<_>>()));
+        assert!(seen.get(&xctest).is_some_and(|d| !d.iter().any(|d| d.message.contains("No such module"))));
+
+        let broken = texts[&typo].1.replacen("nonisolated enum", "@mainactors\nnonisolated enum", 1);
+        server_for(&typo).sync(&path_to_uri(&typo), "swift", true, &Rope::from(broken.as_str()));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            latest_diagnostics(&receiver, &mut seen);
+            let messages: Vec<String> = seen.get(&typo).map(|d| d.iter().map(|d| d.message.clone()).collect()).unwrap_or_default();
+            if messages.iter().any(|m| m.contains("mainactors")) {
+                eprintln!("typo diagnostics: {messages:?}");
+                assert!(!messages.iter().any(|m| m.contains("Cannot find 'AppVersion'")), "{messages:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no @mainactors error: {messages:?}");
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
 
     #[test]

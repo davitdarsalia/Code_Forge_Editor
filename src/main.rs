@@ -30,6 +30,7 @@ mod theme;
 mod tools;
 mod ui;
 mod workspace;
+mod xcode_lsp;
 
 use std::borrow::Cow;
 use std::path::PathBuf;
