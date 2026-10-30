@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -695,14 +694,7 @@ impl Workspace {
             return;
         }
         let LoadedText { text, saved_hash, language, mtime: loaded_mtime } = loaded;
-        let definitions = lsp::Kind::for_language(language).map(|kind| {
-            Rc::new(lsp::Definitions {
-                manager: Rc::downgrade(&self.lsp),
-                kind,
-                path: path.to_path_buf(),
-                stale: Rc::new(Cell::new(false)),
-            })
-        });
+        let definitions = lsp::definitions_for(Rc::downgrade(&self.lsp), language, path);
         let show_document = self.show_document_handler(cx);
         let editor = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
@@ -832,7 +824,7 @@ impl Workspace {
     pub fn go_to_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = self.active_doc() else { return };
         let Some(definitions) = doc.definitions.clone() else {
-            self.notify_info("Go to Definition works in Swift and Rust files", cx);
+            self.notify_info(format!("Go to Definition works in {} files", lsp::supported_languages()), cx);
             return;
         };
         let (text, offset) = {
@@ -841,7 +833,7 @@ impl Workspace {
         };
         let request = definitions.definitions(&text, offset, window, cx);
         let kind = definitions.kind;
-        let indexing = format!("{} is still indexing the project; try again shortly", kind.server_name());
+        let indexing = format!("{} is still indexing the project; try again shortly", kind.map_or("the symbol index", |k| k.server_name()));
         self.definition_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = request.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -853,7 +845,7 @@ impl Workspace {
                             .and_then(|link| Some((lsp::uri_to_path(link.target_uri.as_str())?, link.target_selection_range.start)));
                         match target {
                             Some((path, start)) => this.jump_to(&path, start, window, cx),
-                            None if this.lsp.indexing(kind) => this.notify_info(indexing, cx),
+                            None if kind.is_some_and(|kind| this.lsp.indexing(kind)) => this.notify_info(indexing, cx),
                             None => this.notify_info("No definition found", cx),
                         }
                     }
@@ -1575,7 +1567,7 @@ impl Workspace {
         }
         let (kind, path, stale) = (definitions.kind, doc.path.clone(), definitions.stale.replace(false));
         let text = doc.editor.read(cx).text().clone();
-        self.lsp.sync(kind, &path, stale, &text, cx);
+        self.lsp.sync(kind, definitions.language, &path, stale, &text, cx);
     }
 
     fn on_lsp_event(&mut self, event: lsp::Event, cx: &mut Context<Self>) {
@@ -1591,6 +1583,17 @@ impl Workspace {
             lsp::Event::Stopped { kind, reason, spawn_failed } => {
                 if let Some(message) = self.lsp.stopped(kind, reason, spawn_failed) {
                     self.notify_error(message, cx);
+                }
+                if self.lsp.resync_kind(kind) {
+                    let ids: Vec<usize> = self
+                        .docs
+                        .iter()
+                        .filter(|d| d.definitions.as_ref().is_some_and(|def| def.kind == Some(kind)))
+                        .map(|d| d.id)
+                        .collect();
+                    for id in ids {
+                        self.sync_lsp(id, cx);
+                    }
                 }
             }
         }
