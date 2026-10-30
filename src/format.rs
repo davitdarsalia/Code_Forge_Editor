@@ -565,6 +565,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn which_finds_system_tools_and_search_dirs_cover_brew_and_cargo() {
+        assert!(which("sh").is_some_and(|p| p.ends_with("sh") && p.is_file()));
+        assert!(which("forge-definitely-not-a-tool").is_none());
+        let dirs = search_dirs();
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(dirs.contains(&PathBuf::from("/usr/bin")));
+        if let Some(home) = dirs::home_dir() {
+            assert!(dirs.contains(&home.join(".cargo/bin")));
+        }
+    }
+
+    #[test]
     fn reindents_groovy_gradle() {
         let input = "android {\ncompileSdk 34\n  defaultConfig {\n        minSdk 24\n  }\n}\n";
         let want = "android {\n    compileSdk 34\n    defaultConfig {\n        minSdk 24\n    }\n}\n";

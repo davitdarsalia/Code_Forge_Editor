@@ -3204,6 +3204,47 @@ mod tests {
     }
 
     #[test]
+    fn push_history_skips_duplicates_and_caps_length() {
+        let point = |line: u32| NavPoint { path: PathBuf::from("/p/a.rs"), position: Position { line, character: 0 } };
+        let mut stack = Vec::new();
+        Workspace::push_history(&mut stack, point(1));
+        Workspace::push_history(&mut stack, point(1));
+        assert_eq!(stack.len(), 1);
+        Workspace::push_history(&mut stack, point(2));
+        Workspace::push_history(&mut stack, point(1));
+        assert_eq!(stack.len(), 3);
+        for line in 0..(MAX_HISTORY as u32 + 10) {
+            Workspace::push_history(&mut stack, point(line + 10));
+        }
+        assert_eq!(stack.len(), MAX_HISTORY);
+        assert!(stack.last() == Some(&point(MAX_HISTORY as u32 + 19)));
+        assert!(stack.first() == Some(&point(20)));
+    }
+
+    #[test]
+    fn format_bytes_and_shorten_home_render_labels() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MB");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(shorten_home(&home.join("code/forge")), "~/code/forge");
+        }
+        assert_eq!(shorten_home(Path::new("/nonexistent-root/x")), "/nonexistent-root/x");
+    }
+
+    #[test]
+    fn git_root_finds_enclosing_repository() {
+        let dir = std::env::temp_dir().join(format!("forge-ws-gitroot-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        let file = dir.join("src/deep/a.rs");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(git_root(&file), Some(dir.clone()));
+        assert_eq!(git_root(&dir), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn load_text_rejects_binary_and_non_utf8() {
         let dir = std::env::temp_dir().join(format!("forge-ws-load-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -83,6 +83,11 @@ Forge is a single-crate macOS code editor. `main.rs` (612 lines) registers actio
   - `lsp::Manager`/`Server` (`Rc`/`RefCell`/`Cell`, `src/lsp.rs:209-215`) are main-thread-only by construction, so any server start/IO there must be audited.
 - **Found by:** Error Handling, Structure, Integration & Data
 - **Parallel work:** being addressed by w2-ui-thread; re-review after merge.
+- **Revalidated 2026-10-30 (main c3f99cd):** open (`load_text`), autosave (`save_doc_async` + `run_save` in `background_spawn`), reload probes, tree refresh and fuzzy matching moved off the UI thread in b7775af/d52cdfb. Remaining: `Node::root`/`toggle`/`reveal` still call `list_dir` synchronously for one directory (`src/files.rs:25-105`), and forced `save_doc`/`save_all` on close/quit/project switch stay synchronous by design (must finish before the window goes).
+- **Status:** Partially fixed
+- **Status reason:** Hot paths offloaded by the ui-thread branch; single-directory listing on expand/reveal and forced saves on close remain synchronous.
+- **Status date:** 2026-10-30 08:50 UTC
+- **Status commit:** b7775af
 
 ### [F-3] Language servers are hard-wired to two languages via a closed enum and string matches
 - **Category:** 7 / 13 Inconsistent boundaries; blocks the stated roadmap (many LSPs)
@@ -91,6 +96,10 @@ Forge is a single-crate macOS code editor. `main.rs` (612 lines) registers actio
 - **Evidence:** `src/lsp.rs:25-84` (`enum Kind { Swift, Rust }`, `for_language`, `server_name`, `language_id`, `marker`, `prefers_topmost`, `command`, `initialization_options` all `match self`); `src/workspace.rs:589` (`lsp::Kind::for_language(language)`), `:709` ("Go to Definition works in Swift and Rust files"); `src/lsp.rs:13` imports `crate::format` just to reuse `which`/`search_dirs`. Capability set is hard-coded to `definition` only (`:~270`).
 - **Found by:** Coupling, Structure
 - **Parallel work:** w2-diagnostics edits `lsp.rs`/workspace; sequence after it.
+- **Status:** Fixed (pre-existing)
+- **Status reason:** `lsp::Kind` is now a key into the data-driven `SPECS` table (`src/lsp.rs:45-415`: binary, args, markers, topmost, init options, settings, language ids, pull diagnostics); `supported_languages()` builds the notification text from it. 15 servers.
+- **Status date:** 2026-10-30 08:50 UTC
+- **Status commit:** 0034c73
 
 ### [F-4] Language identity is a stringly-typed value spread across five modules
 - **Category:** 13 Inconsistent boundaries / 28 Magic strings / 9 Shotgun surgery
