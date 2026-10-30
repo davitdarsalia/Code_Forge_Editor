@@ -2239,6 +2239,7 @@ impl Workspace {
                                 .bordered(false)
                                 .appearance(false)
                                 .text_size(px(Settings::get(cx).editor_font_size))
+                                .line_height(gpui_kit::gpui::relative(crate::theme::EDITOR_LINE_HEIGHT))
                                 .h_full(),
                         )
                         .when_some(self.issues.marks(&doc.path), |el, marks| {
@@ -2431,7 +2432,7 @@ impl Workspace {
                             .gap(px(6.))
                             .text_size(px(10.5))
                             .text_color(Palette::faint())
-                            .child(div().font_family(crate::theme::MONO_FONT).child(commit.hash.clone()))
+                            .child(div().font_family(crate::theme::mono_font()).child(commit.hash.clone()))
                             .child(commit.author.clone())
                             .child(commit.when.clone()),
                     )
@@ -2547,7 +2548,7 @@ impl Workspace {
                     .flex_1()
                     .overflow_y_scroll()
                     .py(px(4.))
-                    .font_family(crate::theme::MONO_FONT)
+                    .font_family(crate::theme::mono_font())
                     .text_size(px(11.))
                     .children(self.index_log.iter().rev().map(|line| {
                         div()
@@ -2941,7 +2942,7 @@ impl Render for Workspace {
             .flex_col()
             .bg(Palette::editor_bg())
             .text_color(Palette::text())
-            .font_family(".SystemUIFont")
+            .font_family(crate::theme::UI_FONT)
             .text_size(px(13.))
             .when(self.drag.is_some(), |el| {
                 el.on_mouse_move(cx.listener(Self::on_drag_move))

@@ -626,7 +626,7 @@ impl QuickOpen {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_color(Palette::text())
-                                    .font_family(crate::theme::MONO_FONT)
+                                    .font_family(crate::theme::mono_font())
                                     .text_size(px(12.))
                                     .child(snippet),
                             )
@@ -695,7 +695,7 @@ impl QuickOpen {
                             .w(px(64.))
                             .flex_none()
                             .text_size(px(10.5))
-                            .font_family(crate::theme::MONO_FONT)
+                            .font_family(crate::theme::mono_font())
                             .text_color(Palette::accent())
                             .child(symbol.kind),
                     )

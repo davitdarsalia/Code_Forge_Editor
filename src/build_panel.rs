@@ -15,7 +15,7 @@ use crate::build::{
     Severity,
 };
 use crate::file_icons;
-use crate::theme::{MONO_FONT, Palette, ca};
+use crate::theme::{mono_font, Palette, ca};
 
 const MAX_LOG_LINES: usize = 20_000;
 const MAX_LINE_BYTES: usize = 2_048;
@@ -614,7 +614,7 @@ impl BuildPanel {
         }))
         .track_scroll(&self.scroll)
         .flex_1()
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(px(11.5))
         .into_any_element()
     }
