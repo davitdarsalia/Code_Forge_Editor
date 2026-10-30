@@ -205,6 +205,8 @@ impl SearchHandle {
     }
 }
 
+const MAX_SEARCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
 pub fn search(
     index: Arc<FileIndex>,
     query: &str,
@@ -237,6 +239,9 @@ pub fn search(
                 let ix = next.fetch_add(1, Ordering::Relaxed);
                 let Some(relative) = index.files.get(ix) else { break };
                 let path = index.root.join(relative);
+                if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_SEARCH_FILE_BYTES) {
+                    continue;
+                }
                 let mut matches = Vec::new();
                 let _ = searcher.search_path(
                     &matcher,
@@ -319,6 +324,17 @@ mod tests {
         let index = build_index(&dir);
         assert!(index.files.contains(&"src/main.rs".to_string()));
         assert!(!index.files.iter().any(|f| f.starts_with("ignored")));
+    }
+
+    #[test]
+    fn search_skips_oversized_files() {
+        let dir = fixture();
+        std::fs::write(dir.join("big.txt"), "hello_world\n".repeat(400_000)).unwrap();
+        let index = Arc::new(build_index(&dir));
+        let (_handle, rx) = search(index, "hello_world", SearchOptions::default()).unwrap();
+        let hits: Vec<_> = rx.iter().flatten().collect();
+        assert!(hits.iter().all(|h| h.path != "big.txt"));
+        assert!(!hits.is_empty());
     }
 
     #[test]

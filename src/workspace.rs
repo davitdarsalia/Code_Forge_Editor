@@ -39,6 +39,7 @@ use crate::theme::{Palette, ca};
 
 const GIT_REFRESH_DELAY: Duration = Duration::from_millis(600);
 const ACTIVATION_RESYNC_MIN: Duration = Duration::from_secs(2);
+const INDEX_REWALK_MIN: Duration = Duration::from_secs(30);
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const TOOLBAR_HEIGHT: f32 = 38.;
 const STATUS_HEIGHT: f32 = 22.;
@@ -138,6 +139,7 @@ pub struct Workspace {
     repo: Option<RepoState>,
     git_marks: Rc<TreeMarks>,
     last_sync: Option<Instant>,
+    last_walk: Option<Instant>,
     git_busy: bool,
     git_task: Option<Task<()>>,
     selected_change: Option<(bool, PathBuf)>,
@@ -327,7 +329,9 @@ impl Workspace {
                 this.last_sync = Some(Instant::now());
                 this.refresh_tree(cx);
                 this.refresh_git(cx);
-                this.reindex(cx);
+                if this.index_is_stale() {
+                    this.reindex(cx);
+                }
             } else {
                 let ids: Vec<usize> = this.docs.iter().filter(|d| d.dirty).map(|d| d.id).collect();
                 for id in ids {
@@ -379,6 +383,7 @@ impl Workspace {
             repo: None,
             git_marks: Rc::default(),
             last_sync: None,
+            last_walk: None,
             git_busy: false,
             git_task: None,
             selected_change: None,
@@ -487,8 +492,13 @@ impl Workspace {
         cx.notify();
     }
 
+    fn index_is_stale(&self) -> bool {
+        self.indexing.is_none() && self.last_walk.is_none_or(|at| at.elapsed() >= INDEX_REWALK_MIN)
+    }
+
     fn reindex(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
+        self.last_walk = Some(Instant::now());
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
         if self.index.is_none() {
@@ -617,6 +627,9 @@ impl Workspace {
             return;
         }
         self.quick_open_visible = true;
+        if self.index_is_stale() {
+            self.reindex(cx);
+        }
         let index = self.index.clone();
         let active = self.active_doc().map(|doc| (doc.path.clone(), doc.editor.clone()));
         self.quick_open.update(cx, |q, cx| q.show(index, active, window, cx));
@@ -926,13 +939,16 @@ impl Workspace {
     fn schedule_save(&mut self, id: usize, cx: &mut Context<Self>) {
         let delay = Settings::get(cx).autosave_delay();
         let Some(doc) = self.docs.iter_mut().find(|d| d.id == id) else { return };
+        let became_dirty = !doc.dirty;
         doc.dirty = true;
         doc.edit_gen += 1;
         doc.save_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |this, cx| this.save_doc_async(id, cx));
         }));
-        cx.notify();
+        if became_dirty {
+            cx.notify();
+        }
     }
 
     fn save_doc_async(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -1104,7 +1120,7 @@ impl Workspace {
         let (id, path) = (doc.id, doc.path.clone());
         let text = doc.editor.read(cx).value().to_string();
         let language = files::language_for(&path);
-        let before = hash_text(&text);
+        let before = doc.edit_gen;
         self.format_task = Some(cx.spawn_in(window, async move |this, cx| {
             let outcome = cx
                 .background_spawn(async move { crate::format::format(&path, language, &text) })
@@ -1125,6 +1141,7 @@ impl Workspace {
         self.format_task = None;
         let Some(doc) = self.docs.iter().find(|d| d.id == id) else { return };
         let editor = doc.editor.clone();
+        let changed_meanwhile = doc.edit_gen != before;
         let (text, notice) = match outcome {
             Outcome::Changed { text, notice } => (text, notice),
             Outcome::Unchanged { notice } => {
@@ -1138,7 +1155,7 @@ impl Workspace {
                 return;
             }
         };
-        if hash_text(&editor.read(cx).value()) != before {
+        if changed_meanwhile {
             self.notify_info("File changed while formatting; press ⌘I again", cx);
             return;
         }
