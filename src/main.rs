@@ -38,7 +38,7 @@ use gpui_kit::{
 };
 
 use settings::Settings;
-use workspace::Workspace;
+use workspace::{CloseKind, Workspace};
 
 actions!(
     forge,
@@ -51,6 +51,13 @@ actions!(
         SaveFile,
         SaveAll,
         CloseTab,
+        CloseOtherTabs,
+        CloseTabsToRight,
+        CloseTabsToLeft,
+        CloseSavedTabs,
+        CloseAllTabs,
+        CopyPath,
+        CopyRelativePath,
         NextTab,
         PreviousTab,
         ToggleNavigator,
@@ -290,6 +297,14 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Save", SaveFile),
             MenuItem::action("Save All", SaveAll),
             MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Close Other Tabs", CloseOtherTabs),
+            MenuItem::action("Close Tabs to the Right", CloseTabsToRight),
+            MenuItem::action("Close Tabs to the Left", CloseTabsToLeft),
+            MenuItem::action("Close Saved Tabs", CloseSavedTabs),
+            MenuItem::action("Close All Tabs", CloseAllTabs),
+            MenuItem::separator(),
+            MenuItem::action("Copy Path", CopyPath),
+            MenuItem::action("Copy Relative Path", CopyRelativePath),
         ]),
         Menu::new("Edit").items([
             MenuItem::os_action("Undo", Undo, OsAction::Undo),
@@ -419,6 +434,13 @@ fn register_actions(cx: &mut App) {
             with_workspace(cx, |ws, window, cx| ws.close_active(window, cx))
         }
     });
+    cx.on_action(|_: &CloseOtherTabs, cx| with_workspace(cx, |ws, window, cx| ws.close_tabs(CloseKind::Others, None, window, cx)));
+    cx.on_action(|_: &CloseTabsToRight, cx| with_workspace(cx, |ws, window, cx| ws.close_tabs(CloseKind::Right, None, window, cx)));
+    cx.on_action(|_: &CloseTabsToLeft, cx| with_workspace(cx, |ws, window, cx| ws.close_tabs(CloseKind::Left, None, window, cx)));
+    cx.on_action(|_: &CloseSavedTabs, cx| with_workspace(cx, |ws, window, cx| ws.close_tabs(CloseKind::Saved, None, window, cx)));
+    cx.on_action(|_: &CloseAllTabs, cx| with_workspace(cx, |ws, window, cx| ws.close_tabs(CloseKind::All, None, window, cx)));
+    cx.on_action(|_: &CopyPath, cx| with_workspace(cx, |ws, _, cx| ws.copy_tab_path(false, None, cx)));
+    cx.on_action(|_: &CopyRelativePath, cx| with_workspace(cx, |ws, _, cx| ws.copy_tab_path(true, None, cx)));
     cx.on_action(|_: &NextTab, cx| with_workspace(cx, |ws, window, cx| ws.cycle_tab(true, window, cx)));
     cx.on_action(|_: &PreviousTab, cx| with_workspace(cx, |ws, window, cx| ws.cycle_tab(false, window, cx)));
     cx.on_action(|_: &ToggleNavigator, cx| with_workspace(cx, |ws, _, cx| ws.toggle_left(cx)));
@@ -504,7 +526,13 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
         KeyBinding::new("ctrl-~", NewTerminal, None),
         KeyBinding::new("cmd-g", FocusCommit, None),
-        KeyBinding::new("cmd-alt-c", FocusCommit, None),
+        KeyBinding::new("cmd-alt-c", CopyPath, None),
+        KeyBinding::new("cmd-alt-shift-c", CopyRelativePath, None),
+        KeyBinding::new("cmd-alt-t", CloseOtherTabs, None),
+        KeyBinding::new("cmd-k cmd-right", CloseTabsToRight, None),
+        KeyBinding::new("cmd-k cmd-left", CloseTabsToLeft, None),
+        KeyBinding::new("cmd-k u", CloseSavedTabs, None),
+        KeyBinding::new("cmd-k cmd-w", CloseAllTabs, None),
         KeyBinding::new("cmd-alt-x", GitPull, None),
         KeyBinding::new("cmd-alt-p", GitPush, None),
         KeyBinding::new("cmd-alt-f", GitFetch, None),

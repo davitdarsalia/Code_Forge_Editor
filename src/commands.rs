@@ -1,7 +1,7 @@
 use gpui_kit::Action;
 
 use crate::{
-    Build, ClearRecent, CleanBuild, CloneRepository, CloseTab, FindInProject, FocusCommit, FocusTerminal,
+    Build, ClearRecent, CleanBuild, CloneRepository, CloseTab, CloseOtherTabs, CloseTabsToRight, CloseTabsToLeft, CloseSavedTabs, CloseAllTabs, CopyPath, CopyRelativePath, FindInProject, FocusCommit, FocusTerminal,
     FormatFile, GitFetch, GoBack, GoForward, JumpToDefinition, GitPull, GitPush, InstallBuild, Minimize, NewFile, NewTerminal, NewWindow, NextTab,
     OpenFolder, OpenSettings, PreviousTab, QuickOpenFile, Quit, RevealInNavigator, SaveAll, SaveFile,
     ShowChangesNavigator, ShowFilesNavigator, ShowSearchNavigator, StopBuild, ToggleInspector, ToggleNavigator,
@@ -23,6 +23,13 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "Save", keys: "⌘S", action: || Box::new(SaveFile) },
     Command { name: "Save All", keys: "⌥⌘S", action: || Box::new(SaveAll) },
     Command { name: "Close Tab", keys: "⌘W", action: || Box::new(CloseTab) },
+    Command { name: "Close Other Tabs", keys: "⌥⌘T", action: || Box::new(CloseOtherTabs) },
+    Command { name: "Close Tabs to the Right", keys: "⌘K ⌘→", action: || Box::new(CloseTabsToRight) },
+    Command { name: "Close Tabs to the Left", keys: "⌘K ⌘←", action: || Box::new(CloseTabsToLeft) },
+    Command { name: "Close Saved Tabs", keys: "⌘K U", action: || Box::new(CloseSavedTabs) },
+    Command { name: "Close All Tabs", keys: "⌘K ⌘W", action: || Box::new(CloseAllTabs) },
+    Command { name: "Copy Path", keys: "⌥⌘C", action: || Box::new(CopyPath) },
+    Command { name: "Copy Relative Path", keys: "⌥⇧⌘C", action: || Box::new(CopyRelativePath) },
     Command { name: "Clear Recent Projects", keys: "", action: || Box::new(ClearRecent) },
     Command { name: "Format File", keys: "⌘I", action: || Box::new(FormatFile) },
     Command { name: "Show Files Navigator", keys: "⌘1", action: || Box::new(ShowFilesNavigator) },
