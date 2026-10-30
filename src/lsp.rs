@@ -21,6 +21,7 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const STDERR_TAIL: usize = 4;
 const CONTENT_MODIFIED: i64 = -32801;
 const MAX_CRASHES: u32 = 3;
+const WARM_SCAN_LINES: usize = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -833,6 +834,7 @@ impl Server {
     fn sync(&self, uri: &str, language_id: &'static str, stale: bool, text: &Rope) {
         let mut open = self.open.borrow_mut();
         let text = text.clone();
+        let text_for_warm = text.clone();
         let uri_owned = uri.to_owned();
         match open.get_mut(uri) {
             None => {
@@ -843,6 +845,7 @@ impl Server {
                     }})
                 });
                 self.pull(uri);
+                self.warm(uri, &text_for_warm);
             }
             Some(version) if stale => {
                 *version += 1;
@@ -857,6 +860,17 @@ impl Server {
             }
             Some(_) => {}
         }
+    }
+
+    fn warm(&self, uri: &str, text: &Rope) {
+        if self.kind != Kind::Swift {
+            return;
+        }
+        let Some((line, character)) = first_import(text) else { return };
+        let _ = self.request(
+            "textDocument/definition",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }),
+        );
     }
 
     fn saved(&self, uri: &str) {
@@ -887,6 +901,19 @@ impl Drop for Server {
             });
         }
     }
+}
+
+fn first_import(text: &Rope) -> Option<(u32, u32)> {
+    for line in 0..text.lines_len().min(WARM_SCAN_LINES) {
+        let content = line_text(text, line as u32);
+        let trimmed = content.trim_start();
+        let Some(rest) = trimmed.strip_prefix("import ") else { continue };
+        let indent = content.len() - trimmed.len();
+        let name = rest.trim_start();
+        let column = indent + "import ".len() + (rest.len() - name.len());
+        return Some((line as u32, utf16_column(&content, content[..column].chars().count() as u32)));
+    }
+    None
 }
 
 fn read_message(reader: &mut impl BufRead) -> Option<Value> {
@@ -1327,6 +1354,13 @@ mod tests {
     }
 
     #[test]
+    fn first_import_points_at_module_name() {
+        let text = Rope::from("// c\n  import  Foundation\nlet x = 1\n");
+        assert_eq!(first_import(&text), Some((1, 10)));
+        assert_eq!(first_import(&Rope::from("let x = 1\n")), None);
+    }
+
+    #[test]
     fn languages_map_to_server_specs() {
         assert_eq!(Kind::for_file("swift", Path::new("x")), Some(Kind::Swift));
         assert_eq!(Kind::for_file("rust", Path::new("x")), Some(Kind::Rust));
@@ -1559,6 +1593,52 @@ mod tests {
         let value = reply.recv_timeout(Duration::from_secs(60)).unwrap().unwrap();
         let links = into_links(serde_json::from_value(value).unwrap());
         assert!(links[0].target_uri.as_str().ends_with("Foundation.swiftinterface"), "{links:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn timed_definition(server: &Server, uri: &str, line: u32, character: u32) -> (Duration, Vec<LocationLink>) {
+        let start = Instant::now();
+        let reply = server.request(
+            "textDocument/definition",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }),
+        );
+        let value = reply.recv_timeout(Duration::from_secs(120)).unwrap().unwrap();
+        let links = into_links(serde_json::from_value(value).unwrap());
+        (start.elapsed(), links)
+    }
+
+    #[test]
+    #[ignore]
+    fn sourcekit_definition_latency_breakdown() {
+        let dir = std::env::temp_dir().join(format!("forge-lsp-swift-lat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.swift");
+        let text = "import Foundation\nstruct Point { var x = 1 }\nlet p = Point()\nlet d = Date()\nprint(p.x, d)\n";
+        std::fs::write(&file, text).unwrap();
+        let (events, _receiver) = flume::unbounded();
+        let started = Instant::now();
+        let server = Server::start(Kind::Swift, &dir, events);
+        let uri = path_to_uri(&file);
+        server.sync(&uri, "swift", false, &Rope::from(text));
+        std::thread::sleep(Duration::from_secs(std::env::var("FORGE_TEST_SETTLE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)));
+        let (same_cold, links) = timed_definition(&server, &uri, 2, 9);
+        eprintln!("cold server: first same-file definition {same_cold:?} (since start {:?})", started.elapsed());
+        assert!(links[0].target_uri.as_str().ends_with("main.swift"));
+        let (same_warm, _) = timed_definition(&server, &uri, 2, 9);
+        eprintln!("warm server: same-file definition {same_warm:?}");
+        let (foundation, links) = timed_definition(&server, &uri, 3, 9);
+        eprintln!("warm server: Date definition into interface {foundation:?}");
+        let target = uri_to_path(links[0].target_uri.as_str()).unwrap();
+        eprintln!("interface target {}", target.display());
+        let read_start = Instant::now();
+        let bytes = std::fs::read(&target).unwrap();
+        let body = String::from_utf8(bytes).unwrap();
+        eprintln!("read+decode {:?} ({} lines)", read_start.elapsed(), body.lines().count());
+        let rope_start = Instant::now();
+        let rope = Rope::from(body.as_str());
+        eprintln!("rope build {:?}", rope_start.elapsed());
+        let _ = rope;
+        drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

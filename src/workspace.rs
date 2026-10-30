@@ -13,7 +13,7 @@ use gpui_kit::base::{Spring, spring};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::Icon;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, MouseButton, MouseMoveEvent, Context, Entity, ExternalPaths, FocusHandle,
+    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, MouseButton, MouseDownEvent, MouseMoveEvent, Context, Entity, ExternalPaths, FocusHandle,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, PromptLevel,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
     ScrollStrategy, UniformListScrollHandle, div, prelude::FluentBuilder as _, px, uniform_list,
@@ -677,6 +677,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let read_path = path.clone();
             let loaded = cx.background_spawn(async move { load_text(&read_path) }).await;
+            crate::startup::mark("open: file loaded");
             let _ = this.update_in(cx, |this, window, cx| {
                 let loaded = match loaded {
                     Ok(loaded) => loaded,
@@ -686,6 +687,7 @@ impl Workspace {
                     }
                 };
                 this.finish_open(&path, loaded, window, cx);
+                crate::startup::mark("open: editor built");
                 then(this, window, cx);
             });
         })
@@ -788,7 +790,9 @@ impl Workspace {
 
     fn jump_to(&mut self, path: &Path, lsp_start: Position, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.nav_point(cx);
+        crate::startup::mark("jump: open target");
         self.open_navigated(path, window, cx, move |this, window, cx| {
+            crate::startup::mark("jump: target ready");
             let Some(doc) = this.active_doc() else { return };
             let position = {
                 let text = doc.editor.read(cx).text();
@@ -800,6 +804,7 @@ impl Workspace {
                 Position { line: lsp_start.line, character: lsp::char_column(&line, lsp_start.character) }
             };
             doc.editor.update(cx, |state, cx| state.set_cursor_position(position, window, cx));
+            crate::startup::mark("jump: cursor set");
             if let Some(from) = from {
                 Self::push_history(&mut this.back, from);
                 this.forward.clear();
@@ -824,6 +829,29 @@ impl Workspace {
         });
     }
 
+    fn command_click(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Left
+            || event.click_count != 1
+            || !event.modifiers.secondary(cx)
+            || event.modifiers.alt
+        {
+            return;
+        }
+        let Some(doc) = self.active_doc().filter(|doc| doc.definitions.is_some()) else { return };
+        let (id, before) = (doc.id, doc.editor.read(cx).cursor());
+        let workspace = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            let _ = workspace.update(cx, |this, cx| {
+                let moved = this
+                    .active_doc()
+                    .is_some_and(|doc| doc.id == id && doc.editor.read(cx).cursor() != before);
+                if moved {
+                    this.go_to_definition(window, cx);
+                }
+            });
+        });
+    }
+
     pub fn go_to_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = self.active_doc() else { return };
         let Some(definitions) = doc.definitions.clone() else {
@@ -834,12 +862,14 @@ impl Workspace {
             let state = doc.editor.read(cx);
             (state.text().clone(), state.cursor())
         };
+        crate::startup::mark("definition: request sent");
         let request = definitions.definitions(&text, offset, window, cx);
         let kind = definitions.kind;
         let indexing = format!("{} is still indexing the project; try again shortly", kind.map_or("the symbol index", |k| k.server_name()));
         self.definition_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = request.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                crate::startup::mark("definition: reply received");
                 this.definition_task = None;
                 match result {
                     Ok(links) => {
@@ -2357,6 +2387,9 @@ impl Workspace {
                         .min_w(px(0.))
                         .h_full()
                         .relative()
+                        .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.command_click(event, window, cx);
+                        }))
                         .child(
                             Editor::new(&doc.editor)
                                 .bordered(false)

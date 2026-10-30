@@ -343,4 +343,61 @@ mod tests {
         assert_eq!(color_of(&c, "\"x\""), Some(STRING));
         assert!(color_of(&c, "div").is_some());
     }
+
+    #[test]
+    fn swiftui_source_and_interface_files_highlight() {
+        let src = "import SwiftUI\n\nstruct ContentView: View {\n    @State private var count = 0\n    @Environment(\\.dismiss) var dismiss\n    var body: some View {\n        VStack(spacing: 8) {\n            Text(\"Count \\(count)\")\n                .font(.title)\n            Button(\"Add\") { count += 1 }\n        }\n        .padding()\n    }\n}\n\n#Preview { ContentView() }\n";
+        let c = colors("swift", src);
+        assert_eq!(color_of(&c, "struct"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "private"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "some"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "var"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "State"), Some(ATTRIBUTE));
+                assert!(color_of(&c, "View").is_some());
+        assert!(color_of(&c, "title").is_some());
+        let interface = "// swift-interface-format-version: 1.0\n// swift-compiler-version: Apple Swift version 6.0\nimport Swift\n@available(macOS 10.10, *)\n@frozen public struct Date : Swift.Hashable {\n  public init(timeIntervalSinceNow: Foundation.TimeInterval)\n  public var timeIntervalSince1970: Foundation.TimeInterval { get }\n}\n";
+        let path = std::path::Path::new("/tmp/sourcekit-lsp/GeneratedInterfaces/1/Foundation.swiftinterface");
+        assert_eq!(crate::files::detect_language(path, interface), "swift");
+        let c = colors("swift", interface);
+        assert_eq!(color_of(&c, "import"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "public"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "struct"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "var"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "available"), Some(ATTRIBUTE));
+        assert!(color_of(&c, "// swift-interface-format-version: 1.0").is_some());
+    }
+
+    #[test]
+    #[ignore]
+    fn swift_highlights_real_files_and_times_big_interface() {
+        use gpui_kit::component::highlighter::SyntaxHighlighter;
+        use gpui_kit::component::input::Rope;
+        register();
+        let theme = crate::theme::highlight_theme(gpui_kit::component::ThemeMode::Dark);
+        let home = std::env::var("HOME").unwrap();
+        let real = format!("{home}/Desktop/Projects/ToRelease/Remote-App/DmoteIOS/DMote/App/ContentView.swift");
+        let mut paths = vec![real];
+        if let Ok(found) = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("find /var/folders -name Foundation.swiftinterface 2>/dev/null | head -1")
+            .output()
+        {
+            let line = String::from_utf8_lossy(&found.stdout).trim().to_string();
+            if !line.is_empty() {
+                paths.push(line);
+            }
+        }
+        for path in paths {
+            let source = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(crate::files::detect_language(std::path::Path::new(&path), &source), "swift");
+            let start = std::time::Instant::now();
+            let mut highlighter = SyntaxHighlighter::new("swift");
+            highlighter.update(None, &Rope::from(source.as_str()), None);
+            let parse = start.elapsed();
+            let styled = highlighter.styles(&(0..source.len()), &*theme);
+            let colored = styled.iter().filter(|(_, s)| s.color.is_some()).count();
+            eprintln!("{path}: {} lines, parse+update {parse:?}, total {:?}, {colored} colored spans", source.lines().count(), start.elapsed());
+            assert!(colored > source.lines().count() / 4, "{path}: only {colored} colored spans");
+        }
+    }
 }
