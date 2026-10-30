@@ -5,7 +5,7 @@ use crate::{
     FormatFile, GitFetch, GoBack, GoForward, JumpToDefinition, GitPull, GitPush, InstallBuild, Minimize, NewFile, NewTerminal, NewWindow, NextTab,
     OpenFolder, OpenSettings, PreviousTab, QuickOpenFile, Quit, RevealInNavigator, SaveAll, SaveFile,
     ShowChangesNavigator, ShowFilesNavigator, ShowSearchNavigator, StopBuild, ToggleInspector, ToggleNavigator,
-    TogglePreview, ToggleTerminal, Zoom,
+    ToggleTerminal, Zoom,
 };
 
 pub struct Command {
@@ -30,7 +30,6 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "Show Changes Navigator", keys: "⌘3", action: || Box::new(ShowChangesNavigator) },
     Command { name: "Toggle Navigator", keys: "⌘B", action: || Box::new(ToggleNavigator) },
     Command { name: "Toggle Inspector", keys: "⌘R", action: || Box::new(ToggleInspector) },
-    Command { name: "Toggle Canvas", keys: "⌥⌘↩", action: || Box::new(TogglePreview) },
     Command { name: "Toggle Terminal", keys: "⌘J", action: || Box::new(ToggleTerminal) },
     Command { name: "Focus Terminal", keys: "⌃`", action: || Box::new(FocusTerminal) },
     Command { name: "New Terminal", keys: "⌃⇧`", action: || Box::new(NewTerminal) },

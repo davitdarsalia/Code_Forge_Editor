@@ -13,7 +13,7 @@ The review machine had load average 35-60 (parallel release builds from other ag
 | Binary size | 61.3 MB (stripped, thin LTO) |
 | RSS after 3 s settle | 88-97 MB |
 | Idle CPU (10 s, `ps time` delta) | 0.0-0.7 % |
-| main to `app.run` callback | 420-650 ms under load (dyld of WebKit/CloudKit/CoreData/Metal plus platform init) |
+| main to `app.run` callback | 420-650 ms under load (dyld of frameworks plus platform init; WebKit no longer linked) |
 | `gpui_kit::init` | ~130 ms under load |
 | actions registered to `Workspace::new` | ~155 ms (window creation, Metal layer) |
 | window opened to first frame drawn | ~35 ms |
@@ -22,23 +22,22 @@ The review machine had load average 35-60 (parallel release builds from other ag
 | terminal first shell output | ~700 ms after first frame (spawned after first frame, fine) |
 | fuzzy, 200k synthetic paths, after parallelising | 21-38 ms (`cargo test bench_fuzzy_synthetic -- --ignored --nocapture`) |
 
-Linked at load (`otool -L`): WebKit, CloudKit, CoreData, Metal, AppKit. WebKit/CloudKit/CoreData come from `wry`.
+Linked at load (`otool -L`): Metal, AppKit and friends. WebKit was linked via `wry` and is gone since the preview was removed; CloudKit and CoreData remain, pulled in by gpui (`objc2-app-kit`).
 
 ## Per-keystroke path (reasoning from gpui-base/gpui-component sources)
 
 - Tree-sitter highlighting is incremental: edits are fed to `Tree::edit`, reparse uses a timeout with background fallback (`gpui-component/src/highlighter/highlighter.rs`, `input_adapter.rs`). No full reparse per key. Good.
-- Forge side, `InputEvent::Change` in `workspace.rs` (`open_file` subscription): marks LSP stale, `schedule_save` (debounce timer, re-armed per key), `schedule_preview` (only when the preview is open on that doc). Each calls `cx.notify()` on the whole `Workspace`, so every keystroke re-renders the full workspace view (tabs, tree, panels), not just the editor. This is the largest avoidable per-key cost.
+- Forge side, `InputEvent::Change` in `workspace.rs` (`open_file` subscription): marks LSP stale, `schedule_save` (debounce timer, re-armed per key). Each calls `cx.notify()` on the whole `Workspace`, so every keystroke re-renders the full workspace view (tabs, tree, panels), not just the editor. This is the largest avoidable per-key cost.
 - `save_doc` (after debounce): `editor.value()` copies the whole rope into a `String` and hashes it; on a 50k-line file that is a multi-MB copy plus hash. Now async per the UI-thread branch for the write, but the copy and hash still occur on the UI thread unless that branch moved them.
-- Preview refresh: `refresh_preview` also copies the full source and hashes `(path, source)` every 150 ms of typing when open on tsx/jsx.
 
 ## Prioritized bottlenecks
 
 | # | Bottleneck | Expected gain | Owner file | Proposal |
 |---|---|---|---|---|
 | 1 | Index/git results apply only after window activation (~450 ms in trace) | 300-450 ms to "index ready" | `workspace.rs` (activation observer, `reindex`/`apply_index` task), `main.rs` | Find why foreground tasks wait for activation (the `cx.spawn` result update appears to be starved until the app becomes active). Try `cx.activate(true)` after the window opens (tried; inconclusive on a loaded box, no change committed), or order `activate` so the window is key before spawning index work. Verify with the `window active=` mark vs `index ready`. |
-| 2 | WebKit, CloudKit, CoreData linked at load via wry | 40-120 ms launch, ~10-15 MB RSS (to be measured idle) | `preview.rs` (not edited), `build.rs` | The WebView is already created lazily (only jsx/tsx). Remaining cost is dyld loading the frameworks. Proposal: link with `-Wl,-dead_strip_dylibs` (emit `cargo:rustc-link-arg=-Wl,-dead_strip_dylibs` from `build.rs`), then in `preview.rs` call `dlopen("/System/Library/Frameworks/WebKit.framework/WebKit", RTLD_NOW)` once before `WebViewBuilder::build_as_child`. objc2 resolves classes by name at runtime, so no WebKit symbols are needed at link time; confirm with `otool -L` that WebKit, CloudKit, CoreData drop out and that jsx preview still opens. |
+| 2 | WebKit, CloudKit, CoreData linked at load via wry | 40-120 ms launch, ~10-15 MB RSS | `preview.rs`, `build.rs` | WebKit resolved by removing the preview and `wry`; CloudKit and CoreData still come from gpui `objc2-app-kit`. |
 | 3 | Whole-Workspace `cx.notify()` per keystroke (`schedule_save`) | lower per-key frame cost on big windows | `workspace.rs` | Only notify when `dirty` flips false to true (tab dot) instead of on every Change. |
-| 4 | Full-text copy and hash on save/preview | removes multi-MB UI-thread copy per debounce on 50k-line files | `workspace.rs`, `preview.rs` | Hash from the rope chunks without building a `String`; or use the editor's change counter/version for dirty detection instead of content hash. |
+| 4 | Full-text copy and hash on save | removes multi-MB UI-thread copy per debounce on 50k-line files | `workspace.rs` | Hash from the rope chunks without building a `String`; or use the editor's change counter/version for dirty detection instead of content hash. |
 | 5 | main to `app.run` and `gpui_kit::init` (~130 ms), window creation (~155 ms) | partly framework load (see #2); remainder GPUI/Metal | `main.rs` | Items to check on an idle machine with `sample`: font loading in `gpui_kit::init`, `languages::register()` (all grammars built eagerly, should be lazy per language, owner `languages.rs` / binary-size agent). |
 
 Lower priority: idle CPU ~0.6 % is the GPUI display-link tick plus cursor blink; no Forge-side timers fire at idle (all `timer()` uses are debounces). Reactivation triggers a full re-walk (`reindex`, throttled to once per 2 s), which on large repos will cost CPU on every Cmd-Tab back; consider comparing directory mtimes or using FSEvents instead. Text search spawns `num_cpus` raw threads per query and does not skip huge files; a per-file size cap (e.g. 2 MB) would bound worst cases.

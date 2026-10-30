@@ -15,7 +15,7 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, MouseButton, MouseMoveEvent, Context, Entity, ExternalPaths, FocusHandle,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, PromptLevel,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    ScrollStrategy, UniformListScrollHandle, canvas, div, prelude::FluentBuilder as _, px, uniform_list,
+    ScrollStrategy, UniformListScrollHandle, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 
 use crate::file_icons;
@@ -23,7 +23,6 @@ use crate::build::BuildAction;
 use crate::build_panel::{self, BuildEvent, BuildPanel};
 use crate::files::{self, Node, Row};
 use crate::git::{self, FileStatus, RepoState, TreeMarks};
-use crate::preview::{self, Preview};
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::recent;
 use crate::index_cache;
@@ -70,7 +69,6 @@ enum Drag {
     Left,
     Right,
     Bottom,
-    Preview,
 }
 
 struct Document {
@@ -133,9 +131,6 @@ pub struct Workspace {
     terminal: Option<Entity<Terminal>>,
     bottom_tab: BottomTab,
     build: Entity<BuildPanel>,
-    preview: Preview,
-    show_preview: bool,
-    preview_task: Option<Task<()>>,
     repo: Option<RepoState>,
     git_marks: Rc<TreeMarks>,
     last_sync: Option<Instant>,
@@ -166,7 +161,6 @@ pub struct Workspace {
     left_width: f32,
     right_width: f32,
     terminal_height: f32,
-    preview_width: f32,
     drag: Option<Drag>,
     focus: FocusHandle,
     tree_scroll: UniformListScrollHandle,
@@ -377,9 +371,6 @@ impl Workspace {
             terminal: None,
             bottom_tab: BottomTab::Terminal,
             build,
-            preview: Preview::new(),
-            show_preview: true,
-            preview_task: None,
             repo: None,
             git_marks: Rc::default(),
             last_sync: None,
@@ -410,7 +401,6 @@ impl Workspace {
             left_width: 250.,
             right_width: 260.,
             terminal_height: 220.,
-            preview_width: 420.,
             drag: None,
             focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
@@ -725,14 +715,13 @@ impl Workspace {
         });
         let id = self.next_doc_id;
         self.next_doc_id += 1;
-        let subscription = cx.subscribe_in(&editor, window, move |this, _, event, window, cx| match event {
+        let subscription = cx.subscribe_in(&editor, window, move |this, _, event, _, cx| match event {
             InputEvent::Change => {
                 if let Some(definitions) = this.docs.iter().find(|d| d.id == id).and_then(|d| d.definitions.as_ref()) {
                     definitions.stale.set(true);
                 }
                 this.schedule_lsp_sync(id, cx);
                 this.schedule_save(id, cx);
-                this.schedule_preview(id, window, cx);
             }
             InputEvent::Blur => {
                 if this.docs.iter().any(|d| d.id == id && d.dirty) {
@@ -888,7 +877,6 @@ impl Workspace {
         let editor = self.docs[ix].editor.clone();
         editor.update(cx, |state, cx| state.focus(window, cx));
         self.sync_lsp(self.docs[ix].id, cx);
-        self.refresh_preview(window, cx);
         cx.notify();
     }
 
@@ -1109,7 +1097,6 @@ impl Workspace {
                 for id in reloaded {
                     this.schedule_lsp_sync(id, cx);
                 }
-                this.refresh_preview(window, cx);
                 cx.notify();
             });
         }));
@@ -1174,37 +1161,6 @@ impl Workspace {
 
     fn active_doc(&self) -> Option<&Document> {
         self.active.and_then(|ix| self.docs.get(ix))
-    }
-
-    fn preview_open(&self) -> bool {
-        self.show_preview && self.active_doc().is_some_and(|doc| preview::supports(&doc.path))
-    }
-
-    fn schedule_preview(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.preview_open() || self.active_doc().map(|d| d.id) != Some(id) {
-            return;
-        }
-        self.preview_task = Some(cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(preview::UPDATE_DELAY).await;
-            let _ = this.update_in(cx, |this, window, cx| this.refresh_preview(window, cx));
-        }));
-    }
-
-    fn refresh_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.preview_open() {
-            return;
-        }
-        let Some(doc) = self.active_doc() else { return };
-        let source = doc.editor.read(cx).value();
-        let path = doc.path.clone();
-        self.preview.update(&path, &source, window);
-        cx.notify();
-    }
-
-    pub fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_preview = !self.show_preview;
-        self.refresh_preview(window, cx);
-        cx.notify();
     }
 
     fn rebuild_rows(&mut self) {
@@ -1861,11 +1817,6 @@ impl Workspace {
                     .child(status),
             )
             .child(div().flex_1())
-            .when(self.active_doc().is_some_and(|doc| preview::supports(&doc.path)), |el| {
-                el.child(tool_button("toggle-preview", IconName::Smartphone, self.show_preview, cx.listener(
-                    |this, _, window, cx| this.toggle_preview(window, cx),
-                )))
-            })
             .child(tool_button("toggle-terminal", IconName::PanelBottom, self.show_terminal, cx.listener(
                 |this, _, window, cx| this.toggle_terminal(window, cx),
             )))
@@ -2295,10 +2246,6 @@ impl Workspace {
                             el.child(diagnostics::overlay(doc.editor.clone(), marks, size))
                         }),
                 )
-                .when(self.preview_open(), |el| {
-                    el.child(drag_handle("handle-preview", Drag::Preview, cx))
-                        .child(self.render_preview(cx))
-                })
                 .into_any_element(),
             None => div()
                 .flex_1()
@@ -2317,19 +2264,6 @@ impl Workspace {
             .bg(Palette::editor_bg())
             .when(!self.docs.is_empty(), |el| el.child(self.render_tabs(cx)))
             .child(content)
-    }
-
-    fn render_preview(&self, cx: &App) -> impl IntoElement {
-        let live = !self.quick_open_visible
-            && !self.clone_open
-            && !self.build.read(cx).picker_open()
-            && self.drag != Some(Drag::Preview);
-        div()
-            .w(px(self.preview_width))
-            .flex_none()
-            .h_full()
-            .bg(Palette::panel_bg())
-            .when(live, |el| el.child(canvas(self.preview.place(), |_, _, _, _| {}).size_full()))
     }
 
     fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2936,10 +2870,6 @@ impl Workspace {
         match drag {
             Drag::Left => self.left_width = x.clamp(160., 600.),
             Drag::Right => self.right_width = (f32::from(viewport.width) - x).clamp(180., 600.),
-            Drag::Preview => {
-                let right = if self.show_right { self.right_width + 1. } else { 0. };
-                self.preview_width = (f32::from(viewport.width) - right - x).clamp(240., 1200.);
-            }
             Drag::Bottom => {
                 let bottom = f32::from(viewport.height) - STATUS_HEIGHT;
                 self.terminal_height = (bottom - y).clamp(80., f32::from(viewport.height) - 200.);
@@ -2963,14 +2893,6 @@ impl Render for Workspace {
             window.on_next_frame(|_, _| crate::startup::mark("first frame drawn"));
         }
         self.sync_settings(window, cx);
-        let preview_live = self.preview_open()
-            && !self.quick_open_visible
-            && !self.clone_open
-            && !self.build.read(cx).picker_open()
-            && self.drag != Some(Drag::Preview);
-        if !preview_live {
-            self.preview.hide();
-        }
         let body = if self.root.is_none() && self.docs.is_empty() {
             self.render_welcome(cx).into_any_element()
         } else {
