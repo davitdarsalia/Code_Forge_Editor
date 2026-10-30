@@ -1,0 +1,4 @@
+File icons from Material Icon Theme (github.com/material-extensions/vscode-material-icon-theme)
+MIT License, Copyright (c) 2025 Material Extensions. Permission is hereby granted, free of charge, to any person obtaining a copy of this software, to deal in the Software without restriction, subject to including this notice. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+xcodeproj.svg / xcworkspace.svg from vscode-icons (github.com/vscode-icons/vscode-icons), CC BY-SA 4.0.
+Brand logos remain trademarks of their respective owners.
