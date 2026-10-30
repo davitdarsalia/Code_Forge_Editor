@@ -26,6 +26,7 @@ mod startup;
 mod terminal;
 mod theme;
 mod tools;
+mod ui;
 mod workspace;
 
 use std::borrow::Cow;
