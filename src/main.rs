@@ -5,6 +5,7 @@ mod commands;
 mod build;
 mod build_panel;
 mod builtin_lang;
+mod clone_dialog;
 mod files;
 mod diagnostics;
 mod document;

@@ -5,20 +5,21 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{
-    DefinitionProvider as _, Editor, EditorState, Escape, Input, InputEvent, InputState, Position, RopeExt as _,
+    DefinitionProvider as _, Editor, EditorState, Input, InputEvent, InputState, Position, RopeExt as _,
     ShowDocumentHandler,
 };
 use gpui_kit::base::{Spring, spring};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, MouseButton, MouseDownEvent, MouseMoveEvent, Context, Entity, ExternalPaths, FocusHandle,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, PromptLevel,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PromptLevel,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
     ScrollStrategy, UniformListScrollHandle, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 
 use crate::file_icons;
 use crate::build::BuildAction;
+use crate::clone_dialog::{CloneDialog, CloneEvent};
 use crate::build_panel::{self, BuildEvent, BuildPanel};
 use crate::files::{self, Node, Row};
 use crate::git::{self, FileStatus, RepoState, TreeMarks};
@@ -133,9 +134,7 @@ pub struct Workspace {
     git_task: Option<Task<()>>,
     selected_change: Option<(bool, PathBuf)>,
     commit_input: Entity<InputState>,
-    clone_input: Entity<InputState>,
-    clone_open: bool,
-    clone_busy: bool,
+    clone: Entity<CloneDialog>,
     notice: Option<Notice>,
     notice_task: Option<Task<()>>,
     format_task: Option<Task<()>>,
@@ -174,20 +173,26 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         crate::startup::mark("Workspace::new start");
         let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Commit message"));
-        let clone_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("https://github.com/user/repo.git")
-        });
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe_in(&commit_input, window, |this, _, event, window, cx| {
             if let InputEvent::PressEnter { secondary: true, .. } = event {
                 this.commit(window, cx);
             }
         }));
-        subscriptions.push(cx.subscribe_in(&clone_input, window, |this, _, event, window, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                this.start_clone(window, cx);
+        let clone = cx.new(|cx| CloneDialog::new(window, cx));
+        subscriptions.push(cx.subscribe_in(&clone, window, |this, _, event, window, cx| match event {
+            CloneEvent::Dismissed => this.focus_active_editor(window, cx),
+            CloneEvent::Started(url) => {
+                this.notice = Some(Notice::Info(format!("Cloning {url}…").into()));
+                cx.notify();
+            }
+            CloneEvent::Failed(message) => this.notify_error(message.clone(), cx),
+            CloneEvent::Cloned(path) => {
+                this.notify_info("Clone finished", cx);
+                this.open_project(path.clone(), window, cx);
             }
         }));
+        subscriptions.push(cx.observe(&clone, |_, _, cx| cx.notify()));
         let search = cx.new(|cx| SearchPanel::new(window, cx));
         subscriptions.push(cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
             SearchEvent::Open { path, line, column } => this.open_at(path, *line, *column, window, cx),
@@ -284,9 +289,7 @@ impl Workspace {
             git_task: None,
             selected_change: None,
             commit_input,
-            clone_input,
-            clone_open: false,
-            clone_busy: false,
+            clone,
             notice: None,
             notice_task: None,
             format_task: None,
@@ -1330,58 +1333,7 @@ impl Workspace {
     }
 
     pub fn show_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.clone_open = true;
-        self.clone_input.update(cx, |input, cx| input.focus(window, cx));
-        cx.notify();
-    }
-
-    fn close_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.clone_busy {
-            return;
-        }
-        self.clone_open = false;
-        self.focus_active_editor(window, cx);
-        cx.notify();
-    }
-
-    fn start_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let url = self.clone_input.read(cx).value().trim().to_string();
-        if url.is_empty() || self.clone_busy {
-            return;
-        }
-        if git::repo_name(&url).is_none() {
-            self.notify_error("That does not look like a repository URL", cx);
-            return;
-        }
-        let picked = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Clone Here".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = picked.await else { return };
-            let Some(parent) = paths.into_iter().next() else { return };
-            let _ = this.update(cx, |this, cx| {
-                this.clone_busy = true;
-                this.notice = Some(Notice::Info(format!("Cloning {url}…").into()));
-                cx.notify();
-            });
-            let result = cx.background_spawn(async move { git::clone(&url, &parent) }).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.clone_busy = false;
-                match result {
-                    Ok(path) => {
-                        this.clone_open = false;
-                        this.clone_input.update(cx, |input, cx| input.set_value("", window, cx));
-                        this.notify_info("Clone finished", cx);
-                        this.open_project(path, window, cx);
-                    }
-                    Err(err) => this.notify_error(format!("Clone failed: {err}"), cx),
-                }
-            });
-        })
-        .detach();
+        self.clone.update(cx, |clone, cx| clone.show(window, cx));
     }
 
     pub fn toggle_left(&mut self, cx: &mut Context<Self>) {
@@ -2693,73 +2645,6 @@ impl Workspace {
             )
     }
 
-    fn render_clone_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("clone-overlay")
-            .absolute()
-            .inset_0()
-            .bg(ca(0x000000, 0.45))
-            .flex()
-            .items_start()
-            .justify_center()
-            .pt(px(120.))
-            .on_click(cx.listener(|this, _, window, cx| this.close_clone(window, cx)))
-            .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                this.close_clone(window, cx);
-                cx.stop_propagation();
-            }))
-            .child(
-                div()
-                    .id("clone-dialog")
-                    .w(px(480.))
-                    .p(px(18.))
-                    .rounded(px(12.))
-                    .bg(Palette::toolbar_bg())
-                    .border_1()
-                    .border_color(Palette::hairline())
-                    .shadow_lg()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.))
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(icon(IconName::FolderGit2, 18., Palette::accent()))
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(Palette::text())
-                                    .child("Clone Git Repository"),
-                            ),
-                    )
-                    .child(Input::new(&self.clone_input))
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(Palette::faint())
-                            .child("You will pick the parent folder next. Uses your git credentials."),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap(px(8.))
-                            .child(text_button("clone-cancel", "Cancel", false, cx.listener(|this, _, window, cx| {
-                                this.close_clone(window, cx)
-                            })))
-                            .child(text_button(
-                                "clone-go",
-                                if self.clone_busy { "Cloning…" } else { "Clone…" },
-                                true,
-                                cx.listener(|this, _, window, cx| this.start_clone(window, cx)),
-                            )),
-                    ),
-            )
-    }
 }
 
 fn welcome_action(
@@ -2942,7 +2827,7 @@ impl Render for Workspace {
                         }),
                 )
             })
-            .when(self.clone_open, |el| el.child(self.render_clone_dialog(cx)))
+            .when(self.clone.read(cx).is_open(), |el| el.child(self.clone.clone()))
             .when(self.quick_open_visible, |el| {
                 el.child(
                     div()
