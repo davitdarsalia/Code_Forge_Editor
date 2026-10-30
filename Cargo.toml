@@ -5,48 +5,31 @@ edition = "2024"
 
 [dependencies]
 gpui-kit = { version = "0.8.1", features = [
-    "tree-sitter-astro",
     "tree-sitter-bash",
     "tree-sitter-c",
-    "tree-sitter-cmake",
     "tree-sitter-cpp",
-    "tree-sitter-csharp",
     "tree-sitter-css",
     "tree-sitter-diff",
-    "tree-sitter-ejs",
-    "tree-sitter-elixir",
-    "tree-sitter-erb",
     "tree-sitter-go",
-    "tree-sitter-graphql",
     "tree-sitter-html",
     "tree-sitter-java",
     "tree-sitter-javascript",
     "tree-sitter-jsdoc",
     "tree-sitter-kotlin",
-    "tree-sitter-lua",
     "tree-sitter-make",
     "tree-sitter-markdown",
     "tree-sitter-markdown-inline",
-    "tree-sitter-php",
-    "tree-sitter-proto",
     "tree-sitter-python",
     "tree-sitter-ruby",
     "tree-sitter-rust",
-    "tree-sitter-scala",
-    "tree-sitter-sql",
-    "tree-sitter-svelte",
     "tree-sitter-swift",
     "tree-sitter-toml",
     "tree-sitter-tsx",
     "tree-sitter-typescript",
     "tree-sitter-yaml",
-    "tree-sitter-zig",
 ] }
 anyhow = "1"
-# Go to Definition types shared with the editor (same version as gpui-base).
 lsp-types = "0.97"
-# libgit2, vendored and without network features: status/index/commit run in-process.
-# Network ops stay on the git CLI (see git.rs).
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 portable-pty = "0.9"
 vt100 = "0.18"
@@ -67,7 +50,6 @@ tree-sitter-groovy = "0.1"
 tree-sitter-properties = "0.3"
 tree-sitter-objc = "3"
 tree-sitter-ini = "1"
-tree-sitter-dart = "0.3"
 tree-sitter-batch = "0.11"
 tree-sitter-language = "0.1"
 wry = { version = "0.57.1", default-features = false, features = ["os-webview"] }
