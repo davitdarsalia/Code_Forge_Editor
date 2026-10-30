@@ -52,7 +52,6 @@ tree-sitter-objc = "3"
 tree-sitter-ini = "1"
 tree-sitter-batch = "0.11"
 tree-sitter-language = "0.1"
-wry = { version = "0.57.1", default-features = false, features = ["os-webview"] }
 
 [build-dependencies]
 cc = "1"
@@ -70,31 +69,10 @@ opt-level = 2
 [profile.release.package."*"]
 opt-level = "s"
 
-[profile.release.package.gpui]
-opt-level = 3
-
-[profile.release.package.gpui-base]
-opt-level = 3
-
-[profile.release.package.gpui-component]
-opt-level = 3
-
-[profile.release.package.ropey]
-opt-level = 3
-
 [profile.release.package.tree-sitter]
 opt-level = 3
 
 [profile.release.package.nucleo-matcher]
-opt-level = 3
-
-[profile.release.package.regex-automata]
-opt-level = 3
-
-[profile.release.package.aho-corasick]
-opt-level = 3
-
-[profile.release.package.memchr]
 opt-level = 3
 
 [profile.release.package.ignore]

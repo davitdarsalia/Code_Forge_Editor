@@ -14,7 +14,6 @@ mod index_cache;
 mod issues_panel;
 mod languages;
 mod lsp;
-mod preview;
 mod quick_open;
 mod recent;
 mod scheme_cache;
@@ -63,7 +62,6 @@ actions!(
         ToggleTerminal,
         FocusTerminal,
         NewTerminal,
-        TogglePreview,
         FocusCommit,
         ClearRecent,
         NewFile,
@@ -312,7 +310,6 @@ pub fn set_menus(cx: &mut App) {
             ])),
             MenuItem::action("Toggle Navigator", ToggleNavigator),
             MenuItem::action("Toggle Inspector", ToggleInspector),
-            MenuItem::action("Toggle Canvas", TogglePreview),
             MenuItem::separator(),
             MenuItem::action("Toggle Terminal", ToggleTerminal),
             MenuItem::action("Focus Terminal", FocusTerminal),
@@ -435,9 +432,6 @@ fn register_actions(cx: &mut App) {
     });
     cx.on_action(|_: &FocusTerminal, cx| with_workspace(cx, |ws, window, cx| ws.focus_terminal(window, cx)));
     cx.on_action(|_: &NewTerminal, cx| with_workspace(cx, |ws, window, cx| ws.new_terminal(window, cx)));
-    cx.on_action(|_: &TogglePreview, cx| {
-        with_workspace(cx, |ws, window, cx| ws.toggle_preview(window, cx))
-    });
     cx.on_action(|_: &FocusCommit, cx| with_workspace(cx, |ws, window, cx| ws.focus_commit(window, cx)));
 
     cx.on_action(|_: &QuickOpenFile, cx| {
@@ -509,7 +503,6 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-`", FocusTerminal, None),
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
         KeyBinding::new("ctrl-~", NewTerminal, None),
-        KeyBinding::new("cmd-alt-enter", TogglePreview, None),
         KeyBinding::new("cmd-g", FocusCommit, None),
         KeyBinding::new("cmd-alt-c", FocusCommit, None),
         KeyBinding::new("cmd-alt-x", GitPull, None),
