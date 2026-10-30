@@ -4,9 +4,9 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
+use crate::tools::{search_dirs, which, xcrun_find};
 
-const EXTRA_BIN_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
+const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -136,31 +136,9 @@ pub fn format(path: &Path, language: &str, text: &str) -> Outcome {
     }
 }
 
-pub(crate) fn search_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    dirs.extend(EXTRA_BIN_DIRS.iter().map(PathBuf::from));
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".cargo/bin"));
-        dirs.push(home.join(".local/bin"));
-    }
-    dirs
-}
-
-pub(crate) fn which(name: &str) -> Option<PathBuf> {
-    search_dirs().into_iter().map(|d| d.join(name)).find(|p| p.is_file())
-}
-
 fn xcode_swift_format() -> Option<PathBuf> {
     static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
-    FOUND
-        .get_or_init(|| {
-            let out = Command::new("/usr/bin/xcrun").args(["--find", "swift-format"]).output().ok()?;
-            let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-            (out.status.success() && path.is_file()).then_some(path)
-        })
-        .clone()
+    FOUND.get_or_init(|| xcrun_find("swift-format")).clone()
 }
 
 fn resolve(tool: Tool) -> Option<PathBuf> {
@@ -563,18 +541,6 @@ fn char_literal_end(chars: &[char], start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn which_finds_system_tools_and_search_dirs_cover_brew_and_cargo() {
-        assert!(which("sh").is_some_and(|p| p.ends_with("sh") && p.is_file()));
-        assert!(which("forge-definitely-not-a-tool").is_none());
-        let dirs = search_dirs();
-        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
-        assert!(dirs.contains(&PathBuf::from("/usr/bin")));
-        if let Some(home) = dirs::home_dir() {
-            assert!(dirs.contains(&home.join(".cargo/bin")));
-        }
-    }
 
     #[test]
     fn reindents_groovy_gradle() {

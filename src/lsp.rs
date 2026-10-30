@@ -14,7 +14,8 @@ use gpui_kit::{App, Task, Window};
 use lsp_types::{GotoDefinitionResponse, LocationLink, Position, PublishDiagnosticsParams, Range};
 use serde_json::{Value, json};
 
-use crate::{builtin_lang, format};
+use crate::builtin_lang;
+use crate::tools::{self, xcrun_find};
 
 const IDLE_SHUTDOWN: Duration = Duration::from_secs(10 * 60);
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -108,7 +109,7 @@ fn typescript_init_options(root: &Path) -> Value {
     let tsserver = |dir: &Path| Some(dir.join("typescript/lib/tsserver.js")).filter(|p| p.is_file());
     let local = root.ancestors().find_map(|dir| tsserver(&dir.join("node_modules")));
     let found = local.or_else(|| {
-        let binary = format::which("typescript-language-server")?;
+        let binary = tools::which("typescript-language-server")?;
         let real = binary.canonicalize().unwrap_or(binary);
         real.ancestors().find_map(|dir| tsserver(dir).or_else(|| tsserver(&dir.join("node_modules"))))
     });
@@ -442,7 +443,7 @@ impl Kind {
 
     fn command(self) -> Result<PathBuf, String> {
         let spec = self.spec();
-        format::which(spec.binary)
+        tools::which(spec.binary)
             .or_else(|| if spec.xcrun { xcrun_find(spec.binary) } else { None })
             .ok_or_else(|| spec.missing.to_owned())
     }
@@ -455,12 +456,6 @@ pub fn supported_languages() -> String {
         Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
         _ => labels.join(", "),
     }
-}
-
-fn xcrun_find(binary: &str) -> Option<PathBuf> {
-    let out = Command::new("/usr/bin/xcrun").args(["--find", binary]).output().ok()?;
-    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    (out.status.success() && path.is_file()).then_some(path)
 }
 
 fn root_for(kind: Kind, project: &Path, path: &Path) -> Option<PathBuf> {
@@ -627,7 +622,7 @@ impl Shared {
 
 fn spawn_process(kind: Kind, root: &Path) -> Result<Child, String> {
     let program = kind.command()?;
-    let path_env = std::env::join_paths(format::search_dirs()).unwrap_or_default();
+    let path_env = std::env::join_paths(tools::search_dirs()).unwrap_or_default();
     Command::new(&program)
         .args(kind.spec().args)
         .current_dir(root)
@@ -1781,7 +1776,7 @@ mod tests {
                 .args(["install", "--silent", "--no-audit", "--no-fund", "--prefix"])
                 .arg(&cache)
                 .arg("typescript@5")
-                .env("PATH", std::env::join_paths(format::search_dirs()).unwrap_or_default())
+                .env("PATH", std::env::join_paths(tools::search_dirs()).unwrap_or_default())
                 .status()
                 .unwrap();
             assert!(status.success());

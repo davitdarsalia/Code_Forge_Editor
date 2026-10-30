@@ -136,6 +136,10 @@ Forge is a single-crate macOS code editor. `main.rs` (612 lines) registers actio
 - **Explanation:** All 25 modules are siblings in one crate, so nothing stops logic modules importing gpui or each other. `format.rs` doubles as the tool-discovery utility (`which`, `search_dirs`, xcrun lookup) used by `lsp.rs`; the xcrun `--find` lookup is duplicated. Compile times and test isolation suffer, and the parallel branches all collide in `src/`.
 - **Evidence:** `src/main.rs:3-25` flat `mod` list; `src/format.rs:139-165` (`search_dirs`, `which`, xcrun) vs `src/lsp.rs:84-92` (`xcode_sourcekit_lsp` duplicates the OnceLock + xcrun pattern); `src/lsp.rs:13`.
 - **Found by:** Structure, Coupling
+- **Status:** Partially fixed
+- **Status reason:** Tool discovery (`search_dirs`, `which`, `xcrun_find`) moved out of `format.rs` into `src/tools.rs`; `lsp.rs` no longer imports `format`, and the duplicated xcrun lookup is one function. Crate split (fix-plan step 11) not attempted: very high churn, no enforcement benefit until branches stop landing in `src/`.
+- **Status date:** 2026-10-30 09:00 UTC
+- **Status commit:** TOOLS_SHA
 
 ### [F-9] Critical editor behaviour is untested
 - **Category:** 32 Missing tests
