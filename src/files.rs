@@ -176,7 +176,7 @@ pub fn language_for(path: &Path) -> &'static str {
         "rb" | "rake" | "gemspec" | "podspec" | "ru" | "rbi" | "rbs" => "ruby",
         "erb" | "rhtml" => "erb",
         "dart" => "dart",
-        "m" | "mm" => "objc",
+        "m" | "mm" | "pch" => "objc",
         "js" | "mjs" | "cjs" | "jsx" => "javascript",
         "ts" | "mts" | "cts" => "typescript",
         "tsx" => "tsx",
@@ -188,7 +188,7 @@ pub fn language_for(path: &Path) -> &'static str {
         "md" | "mdx" | "markdown" => "markdown",
         "sh" | "bash" | "zsh" | "fish" => "bash",
         "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "inl" | "ipp" | "tpp" | "ixx" | "cppm" => "cpp",
         "cs" => "csharp",
         "css" | "scss" | "less" => "css",
         "html" | "htm" => "html",
@@ -212,6 +212,9 @@ pub fn language_for(path: &Path) -> &'static str {
 
 pub fn detect_language(path: &Path, text: &str) -> &'static str {
     let language = language_for(path);
+    if language == "c" && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("h")) {
+        return sniff_header(text);
+    }
     if language != "text" {
         return language;
     }
@@ -233,6 +236,22 @@ pub fn detect_language(path: &Path, text: &str) -> &'static str {
         "swift" => "swift",
         _ => language,
     }
+}
+
+fn sniff_header(text: &str) -> &'static str {
+    let head = &text[..text.len().min(32 * 1024)];
+    let objc = ["@interface", "@protocol", "@import", "#import", "@class ", "NS_ASSUME_NONNULL", "@end"];
+    if objc.iter().any(|marker| head.contains(marker)) {
+        return "objc";
+    }
+    let cpp_lines = ["namespace ", "template <", "template<", "class ", "#include <string>", "#include <vector>", "#include <memory>", "public:", "private:", "std::", "constexpr ", "nullptr", "extern \"C++\""];
+    if head.lines().any(|line| {
+        let line = line.trim_start();
+        cpp_lines.iter().any(|marker| line.starts_with(marker) || (marker.ends_with("::") || marker.ends_with("nullptr")) && line.contains(marker))
+    }) {
+        return "cpp";
+    }
+    "c"
 }
 
 pub fn looks_binary(bytes: &[u8]) -> bool {
@@ -420,6 +439,40 @@ mod tests {
             ("README.md", "markdown"),
             (".gitignore", "gitignore"),
             ("scripts/resize.py", "python"),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(language_for(Path::new(name)), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn headers_are_sniffed_for_cpp_and_objc() {
+        let h = Path::new("a.h");
+        assert_eq!(detect_language(h, "#include <stdio.h>\nint f(void);\n"), "c");
+        assert_eq!(detect_language(h, "#pragma once\nnamespace a { class B; }\n"), "cpp");
+        assert_eq!(detect_language(h, "#include <vector>\nstd::vector<int> v;\n"), "cpp");
+        assert_eq!(detect_language(h, "#import <Foundation/Foundation.h>\n@interface A : NSObject\n@end\n"), "objc");
+        assert_eq!(detect_language(Path::new("a.hpp"), "int x;\n"), "cpp");
+        assert_eq!(detect_language(Path::new("a.mm"), "int x;\n"), "objc");
+    }
+
+    #[test]
+    fn gradle_and_web_files_map_to_expected_grammars() {
+        let cases = [
+            ("build.gradle", "groovy"),
+            ("build.gradle.kts", "kotlin"),
+            ("settings.gradle.kts", "kotlin"),
+            ("settings.gradle", "groovy"),
+            ("gradle.properties", "properties"),
+            ("gradle/libs.versions.toml", "toml"),
+            ("gradle/wrapper/gradle-wrapper.properties", "properties"),
+            ("main.go", "go"),
+            ("a.js", "javascript"),
+            ("a.jsx", "javascript"),
+            ("a.ts", "typescript"),
+            ("a.tsx", "tsx"),
+            ("a.cc", "cpp"),
+            ("a.mm", "objc"),
         ];
         for (name, expected) in cases {
             assert_eq!(language_for(Path::new(name)), expected, "{name}");

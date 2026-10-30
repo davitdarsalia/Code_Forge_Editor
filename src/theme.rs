@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Hsla, px, rgb};
 
@@ -43,6 +46,14 @@ pub const MONO_FONT: &str = "Menlo";
 pub const UI_FONT_SIZE: f32 = 13.;
 pub const MONO_FONT_SIZE: f32 = 13.;
 
+const XCODE_DARK: &str = include_str!("../assets/themes/xcode-dark.json");
+const XCODE_LIGHT: &str = include_str!("../assets/themes/xcode-light.json");
+
+pub fn highlight_theme(mode: ThemeMode) -> Arc<HighlightTheme> {
+    let source = if mode.is_dark() { XCODE_DARK } else { XCODE_LIGHT };
+    Arc::new(serde_json::from_str(source).expect("bundled Xcode theme is valid"))
+}
+
 pub fn apply(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);
     let theme = Theme::global_mut(cx);
@@ -58,7 +69,8 @@ pub fn apply(cx: &mut App) {
     theme.primary_hover = Palette::accent_hover();
     theme.primary_active = c(0x0070e0);
     theme.primary_foreground = c(0xffffff);
-    theme.selection = ca(0x0a84ff, 0.35);
+    theme.highlight_theme = highlight_theme(ThemeMode::Dark);
+    theme.selection = c(0x515b70);
     theme.caret = c(0xffffff);
     theme.popover = c(0x2b2b30);
     theme.list_active = Palette::row_selected();
@@ -68,4 +80,20 @@ pub fn apply(cx: &mut App) {
     theme.scrollbar_thumb_hover = ca(0xffffff, 0.3);
     theme.title_bar = Palette::toolbar_bg();
     theme.title_bar_border = Palette::border();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_xcode_themes_parse() {
+        let dark = highlight_theme(ThemeMode::Dark);
+        let light = highlight_theme(ThemeMode::Light);
+        assert!(dark.name.contains("Dark") && light.name.contains("Light"));
+        assert_ne!(dark.style.editor_background, light.style.editor_background);
+        assert_eq!(dark.style.editor_background, Some(c(0x1f1f24)));
+        assert_eq!(dark.style.syntax.style("keyword").and_then(|s| s.color), Some(c(0xfc5fa3)));
+        assert_eq!(light.style.syntax.style("string").and_then(|s| s.color), Some(c(0xc41a16)));
+    }
 }

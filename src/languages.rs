@@ -47,7 +47,7 @@ fn grammars() -> Vec<Grammar> {
         Grammar {
             name: "objc",
             language: tree_sitter_objc::LANGUAGE.into(),
-            highlights: tree_sitter_objc::HIGHLIGHTS_QUERY,
+            highlights: include_str!("../assets/queries/objc-highlights.scm"),
             injections: "",
             locals: tree_sitter_objc::LOCALS_QUERY,
         },
@@ -103,8 +103,26 @@ fn grammars() -> Vec<Grammar> {
     ]
 }
 
+const OVERRIDES: &[(&str, &str)] = &[
+    ("swift", include_str!("../assets/queries/swift-highlights.scm")),
+    ("kotlin", include_str!("../assets/queries/kotlin-highlights.scm")),
+    ("c", include_str!("../assets/queries/c-highlights.scm")),
+    ("cpp", include_str!("../assets/queries/cpp-highlights.scm")),
+    ("go", include_str!("../assets/queries/go-highlights.scm")),
+    ("java", include_str!("../assets/queries/java-highlights.scm")),
+    ("javascript", include_str!("../assets/queries/javascript-highlights.scm")),
+    ("typescript", include_str!("../assets/queries/typescript-highlights.scm")),
+    ("tsx", include_str!("../assets/queries/tsx-highlights.scm")),
+];
+
 pub fn register() {
     let registry = LanguageRegistry::singleton();
+    for (name, highlights) in OVERRIDES {
+        if let Some(mut config) = registry.language(name) {
+            config.highlights = (*highlights).into();
+            registry.register(name, &config);
+        }
+    }
     for grammar in grammars() {
         let config = GrammarConfig::new(
             grammar.name,
@@ -121,6 +139,26 @@ pub fn register() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn override_queries_compile_and_use_themed_captures() {
+        let registry = LanguageRegistry::singleton();
+        let theme = crate::theme::highlight_theme(gpui_kit::component::ThemeMode::Dark);
+        let mut unthemed = Vec::new();
+        for (name, highlights) in OVERRIDES {
+            let language = registry.language(name).expect(name).language.expect(name);
+            let query = match tree_sitter::Query::new(&language, highlights) {
+                Ok(query) => query,
+                Err(err) => panic!("{name} override query is invalid: {err}"),
+            };
+            for capture in query.capture_names() {
+                if !capture.starts_with('_') && theme.style.syntax.style(capture).is_none() {
+                    unthemed.push(format!("{name}: @{capture}"));
+                }
+            }
+        }
+        assert!(unthemed.is_empty(), "{unthemed:#?}");
+    }
 
     #[test]
     fn every_highlight_query_compiles() {
@@ -206,5 +244,110 @@ mod tests {
         assert!(has(&pro, "class", "keyword"));
         assert!(has(&pro, "a.B", "type"));
         assert!(has(&pro, "# c", "comment"));
+    }
+
+    fn colors(language: &str, source: &str) -> Vec<(String, u32)> {
+        use gpui_kit::component::highlighter::SyntaxHighlighter;
+        use gpui_kit::component::input::Rope;
+        register();
+        let theme = crate::theme::highlight_theme(gpui_kit::component::ThemeMode::Dark);
+        let mut highlighter = SyntaxHighlighter::new(language);
+        highlighter.update(None, &Rope::from(source), None);
+        highlighter
+            .styles(&(0..source.len()), &*theme)
+            .into_iter()
+            .filter_map(|(range, style)| {
+                let color = style.color?;
+                let rgba: gpui_kit::Rgba = color.into();
+                let packed = ((rgba.r * 255.).round() as u32) << 16 | ((rgba.g * 255.).round() as u32) << 8 | (rgba.b * 255.).round() as u32;
+                Some((source[range].to_string(), packed))
+            })
+            .collect()
+    }
+
+    fn color_of(colors: &[(String, u32)], text: &str) -> Option<u32> {
+        colors.iter().rev().find(|(t, _)| t == text).map(|(_, c)| *c)
+    }
+
+    const KEYWORD: u32 = 0xfc5fa3;
+    const STRING: u32 = 0xfc6a5d;
+    const COMMENT: u32 = 0x6c7986;
+    const NUMBER: u32 = 0xd0bf69;
+    const TYPE: u32 = 0x9ef1dd;
+    const SYSTEM_TYPE: u32 = 0xd0a8ff;
+    const FUNCTION: u32 = 0x67b7a4;
+    const ATTRIBUTE: u32 = 0xbf8555;
+    const PREPROC: u32 = 0xfd8f3f;
+
+    #[test]
+    fn swift_uses_xcode_colors() {
+        let src = "import Foundation\n@MainActor\nfinal class Foo: Bar {\n    // note\n    let n = 42\n    func run(_ x: Int) -> String { print(\"a \\(x)\"); return \"b\" }\n}\n";
+        let c = colors("swift", src);
+        assert_eq!(color_of(&c, "import"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "class"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "func"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "return"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "42"), Some(NUMBER));
+        assert_eq!(color_of(&c, "// note"), Some(COMMENT));
+        assert_eq!(color_of(&c, "Bar"), Some(TYPE));
+        assert_eq!(color_of(&c, "MainActor"), Some(ATTRIBUTE));
+        assert_eq!(color_of(&c, "run"), Some(FUNCTION));
+        assert_eq!(color_of(&c, "print"), Some(FUNCTION));
+        assert_eq!(color_of(&c, "b"), Some(STRING));
+    }
+
+    #[test]
+    fn kotlin_and_gradle_dsl_highlight() {
+        let src = "plugins { id(\"com.android.application\") }\n@Composable\nfun greet(name: String): Int { val x = 1; return \"hi $name\".length }\n";
+        let c = colors("kotlin", src);
+        assert_eq!(color_of(&c, "fun"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "val"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "1"), Some(NUMBER));
+        assert_eq!(color_of(&c, "Composable"), Some(ATTRIBUTE));
+        assert_eq!(color_of(&c, "greet"), Some(FUNCTION));
+        assert_eq!(color_of(&c, "String"), Some(TYPE));
+    }
+
+    #[test]
+    fn groovy_gradle_highlights_calls_not_bodies() {
+        let src = "dependencies {\n    implementation 'x:y:1'\n    def n = 3\n}\n";
+        let c = colors("groovy", src);
+        assert_eq!(color_of(&c, "implementation"), Some(FUNCTION));
+        assert_eq!(color_of(&c, "def"), Some(KEYWORD));
+        assert!(color_of(&c, "dependencies").is_some());
+    }
+
+    #[test]
+    fn cpp_and_c_highlight_functions_types_and_preprocessor() {
+        let src = "#include <vector>\n#define MAX 3\nclass A { public: int f(int x) const; };\nint main() { std::string s = \"a\"; return f(1); }\n";
+        let c = colors("cpp", src);
+        assert_eq!(color_of(&c, "class"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "return"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "\"a\""), Some(STRING));
+        assert_eq!(color_of(&c, "main"), Some(FUNCTION));
+        assert_eq!(color_of(&c, "int"), Some(SYSTEM_TYPE));
+        assert_eq!(color_of(&c, "#define"), Some(PREPROC));
+        let c = colors("c", "#include <stdio.h>\nstatic int add(int a) { return a + 1; }\n");
+        assert_eq!(color_of(&c, "add"), Some(FUNCTION));
+        assert_eq!(color_of(&c, "static"), Some(KEYWORD));
+    }
+
+    #[test]
+    fn go_js_ts_tsx_highlight() {
+        let c = colors("go", "package main\nfunc add(a int) int { return a + 1 }\n");
+        assert_eq!(color_of(&c, "func"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "add"), Some(FUNCTION));
+        let c = colors("javascript", "const f = (a) => { return a + 1 }\nf(2, 'x')\n");
+        assert_eq!(color_of(&c, "const"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "f"), Some(FUNCTION));
+        assert_eq!(color_of(&c, "'x'"), Some(STRING));
+        let c = colors("typescript", "interface P { a: number }\nfunction g(p: P): string { return \"s\" }\n");
+        assert_eq!(color_of(&c, "interface"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "g"), Some(FUNCTION));
+        assert_eq!(color_of(&c, "number"), Some(SYSTEM_TYPE));
+        let c = colors("tsx", "export const A = (p: Props) => <div className=\"x\">{p.a}</div>;\n");
+        assert_eq!(color_of(&c, "export"), Some(KEYWORD));
+        assert_eq!(color_of(&c, "\"x\""), Some(STRING));
+        assert!(color_of(&c, "div").is_some());
     }
 }
