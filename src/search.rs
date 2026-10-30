@@ -12,6 +12,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 pub const MAX_MATCHES: usize = 20_000;
 const MAX_LINE_CHARS: usize = 240;
 const BATCH: usize = 8;
+const PARALLEL_FUZZY_MIN: usize = 20_000;
 
 pub struct FileIndex {
     pub root: PathBuf,
@@ -103,18 +104,36 @@ pub fn fuzzy(index: &FileIndex, query: &str, limit: usize) -> Vec<FuzzyHit> {
     if query.trim().is_empty() {
         return (0..index.files.len().min(limit)).map(|ix| FuzzyHit { ix, indices: Vec::new() }).collect();
     }
-    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
     let mut buf = Vec::new();
-    let mut scored: Vec<(u32, usize)> = index
-        .files
-        .iter()
-        .enumerate()
-        .filter_map(|(ix, path)| {
-            let score = pattern.score(Utf32Str::new(path, &mut buf), &mut matcher)?;
-            Some((score, ix))
+    let score_range = |range: std::ops::Range<usize>| -> Vec<(u32, usize)> {
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+        let mut buf = Vec::new();
+        range
+            .filter_map(|ix| {
+                let score = pattern.score(Utf32Str::new(&index.files[ix], &mut buf), &mut matcher)?;
+                Some((score, ix))
+            })
+            .collect()
+    };
+    let total = index.files.len();
+    let threads = num_cpus::get().clamp(1, 8);
+    let mut scored: Vec<(u32, usize)> = if total < PARALLEL_FUZZY_MIN || threads < 2 {
+        score_range(0..total)
+    } else {
+        let chunk = total.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let range = (t * chunk).min(total)..((t + 1) * chunk).min(total);
+                    let score_range = &score_range;
+                    scope.spawn(move || score_range(range))
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
         })
-        .collect();
+    };
     scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(index.files[a.1].len().cmp(&index.files[b.1].len())));
     scored.truncate(limit);
     scored
@@ -351,5 +370,19 @@ mod bench {
         let started = std::time::Instant::now();
         let hits = fuzzy(&index, "remsess", 60);
         println!("fuzzy: {} hits in {:?}", hits.len(), started.elapsed());
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_fuzzy_synthetic() {
+        let files: Vec<String> = (0..200_000)
+            .map(|i| format!("pkg{}/module{}/src/component_{}/file_{}.rs", i % 97, i % 1013, i % 31, i))
+            .collect();
+        let index = FileIndex { root: PathBuf::from("/"), files };
+        for query in ["fil", "cmpfile12", "module7src"] {
+            let started = std::time::Instant::now();
+            let hits = fuzzy(&index, query, 60);
+            println!("fuzzy '{query}' over {} files: {} hits in {:?}", index.files.len(), hits.len(), started.elapsed());
+        }
     }
 }
