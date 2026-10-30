@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{App, Hsla, px, rgb};
+use gpui_kit::gpui::TextSystem;
+use gpui_kit::{App, Hsla, font, px, rgb};
 
 pub fn c(hex: u32) -> Hsla {
     rgb(hex).into()
@@ -42,9 +43,33 @@ impl Palette {
     pub fn folder() -> Hsla { c(0x6aa9ff) }
 }
 
-pub const MONO_FONT: &str = "Menlo";
+pub const MONO_FONT: &str = ".AppleSystemUIFontMonospaced";
+pub const MONO_FALLBACK_FONT: &str = "Menlo";
+pub const UI_FONT: &str = ".SystemUIFont";
 pub const UI_FONT_SIZE: f32 = 13.;
-pub const MONO_FONT_SIZE: f32 = 13.;
+pub const MONO_FONT_SIZE: f32 = 12.;
+pub const EDITOR_LINE_HEIGHT: f32 = 1.25;
+
+static RESOLVED_MONO: OnceLock<&'static str> = OnceLock::new();
+
+pub fn mono_font() -> &'static str {
+    RESOLVED_MONO.get().copied().unwrap_or(MONO_FONT)
+}
+
+pub fn is_monospace(text_system: &TextSystem, family: &str) -> bool {
+    let id = text_system.resolve_font(&font(family.to_string()));
+    let size = px(MONO_FONT_SIZE);
+    match (text_system.advance(id, size, 'i'), text_system.advance(id, size, 'm')) {
+        (Ok(narrow), Ok(wide)) => narrow.width > px(0.) && narrow.width == wide.width,
+        _ => false,
+    }
+}
+
+fn resolve_mono_font(cx: &App) -> &'static str {
+    *RESOLVED_MONO.get_or_init(|| {
+        if is_monospace(cx.text_system(), MONO_FONT) { MONO_FONT } else { MONO_FALLBACK_FONT }
+    })
+}
 
 const XCODE_DARK: &str = include_str!("../assets/themes/xcode-dark.json");
 const XCODE_LIGHT: &str = include_str!("../assets/themes/xcode-light.json");
@@ -56,8 +81,10 @@ pub fn highlight_theme(mode: ThemeMode) -> Arc<HighlightTheme> {
 
 pub fn apply(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);
+    let mono = resolve_mono_font(cx);
     let theme = Theme::global_mut(cx);
-    theme.mono_font_family = MONO_FONT.into();
+    theme.font_family = UI_FONT.into();
+    theme.mono_font_family = mono.into();
     theme.mono_font_size = px(MONO_FONT_SIZE);
     theme.font_size = px(UI_FONT_SIZE);
     theme.background = Palette::editor_bg();
@@ -95,5 +122,29 @@ mod tests {
         assert_eq!(dark.style.editor_background, Some(c(0x1f1f24)));
         assert_eq!(dark.style.syntax.style("keyword").and_then(|s| s.color), Some(c(0xfc5fa3)));
         assert_eq!(light.style.syntax.style("string").and_then(|s| s.color), Some(c(0xc41a16)));
+    }
+
+    fn system() -> TextSystem {
+        TextSystem::new(Arc::new(gpui_apple::AppleTextSystem::new()))
+    }
+
+    #[test]
+    fn xcode_mono_font_is_monospace() {
+        let text_system = system();
+        assert!(is_monospace(&text_system, MONO_FONT));
+        assert!(is_monospace(&text_system, MONO_FALLBACK_FONT));
+        assert!(!is_monospace(&text_system, UI_FONT));
+    }
+
+    #[test]
+    fn mono_advance_is_uniform_across_glyphs() {
+        let text_system = system();
+        let id = text_system.resolve_font(&font(MONO_FONT));
+        let size = px(MONO_FONT_SIZE);
+        let reference = text_system.advance(id, size, 'm').unwrap().width;
+        for ch in ['i', 'W', '0', '1', ' ', '{', '~', 'g'] {
+            assert_eq!(text_system.advance(id, size, ch).unwrap().width, reference, "{ch:?}");
+        }
+        assert!(reference > px(6.) && reference < px(9.));
     }
 }

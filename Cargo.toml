@@ -80,3 +80,6 @@ opt-level = 3
 
 [profile.release.package.vt100]
 opt-level = 3
+
+[dev-dependencies]
+gpui-pre-apple = "0.3.10"

@@ -1709,6 +1709,7 @@ dependencies = [
  "flume",
  "git2",
  "gpui-kit",
+ "gpui-pre-apple",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",

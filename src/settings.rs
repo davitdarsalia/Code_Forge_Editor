@@ -32,8 +32,8 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             autosave_delay_ms: 200,
-            editor_font_size: 13.,
-            terminal_font_size: 12.5,
+            editor_font_size: 12.,
+            terminal_font_size: 12.,
             soft_wrap: false,
             show_inspector: true,
             open_last_project: true,
@@ -339,7 +339,7 @@ impl Render for SettingsView {
             .flex_col()
             .bg(Palette::editor_bg())
             .text_color(Palette::text())
-            .font_family(".SystemUIFont")
+            .font_family(crate::theme::UI_FONT)
             .child(section("EDITOR"))
             .child(row("Autosave delay", number_field(&self.autosave, "ms")))
             .child(row("Editor font size", number_field(&self.editor_font, "pt")))

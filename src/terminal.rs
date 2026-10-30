@@ -12,9 +12,9 @@ use gpui_kit::{
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::theme::{MONO_FONT, Palette, c};
+use crate::theme::{Palette, c, mono_font};
 
-const LINE_HEIGHT_RATIO: f32 = 1.36;
+const LINE_HEIGHT_RATIO: f32 = 1.25;
 const SCROLLBACK: usize = 2_000;
 const PADDING: f32 = 8.;
 
@@ -255,7 +255,7 @@ impl Terminal {
             return width;
         }
         let text_system = window.text_system();
-        let font_id = text_system.resolve_font(&mono_font());
+        let font_id = text_system.resolve_font(&terminal_font());
         let width = text_system
             .advance(font_id, px(self.font_size), 'm')
             .map(|size| size.width)
@@ -333,7 +333,7 @@ impl Render for Terminal {
             .overflow_hidden()
             .bg(Palette::panel_bg())
             .p(px(PADDING))
-            .font_family(MONO_FONT)
+            .font_family(mono_font())
             .text_size(px(self.font_size))
             .line_height(px(line_height))
             .text_color(Palette::text())
@@ -369,8 +369,8 @@ fn paste_text(text: &str, bracketed: bool) -> String {
     if bracketed { text.replace("\x1b[201~", "").replace("\x1b[200~", "") } else { text }
 }
 
-fn mono_font() -> Font {
-    font(MONO_FONT)
+fn terminal_font() -> Font {
+    font(mono_font())
 }
 
 fn cell_style(cell: &vt100::Cell, is_cursor: bool, focused: bool) -> Option<HighlightStyle> {

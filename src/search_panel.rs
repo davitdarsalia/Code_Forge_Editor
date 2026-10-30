@@ -292,7 +292,7 @@ impl SearchPanel {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_color(Palette::muted())
-                                .font_family(crate::theme::MONO_FONT)
+                                .font_family(crate::theme::mono_font())
                                 .text_size(px(11.5))
                                 .child(text),
                         ),
