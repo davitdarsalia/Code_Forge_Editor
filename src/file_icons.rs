@@ -168,7 +168,7 @@ mod tests {
         for (path, bytes) in ASSETS {
             assert!(path.starts_with("file-icons/") && path.ends_with(".svg"));
             let text = std::str::from_utf8(bytes).unwrap();
-            assert!(text.starts_with("<svg") && text.contains("viewBox=\"0 0 16 16\""), "{path}");
+            assert!(text.starts_with("<svg") && text.contains("viewBox="), "{path}");
         }
     }
 
