@@ -5,7 +5,7 @@ use crate::{
     FormatFile, GitFetch, GoBack, GoForward, JumpToDefinition, GitPull, GitPush, InstallBuild, Minimize, NewFile, NewTerminal, NewWindow, NextTab,
     OpenFolder, OpenSettings, PreviousTab, QuickOpenFile, RenameSymbol, Quit, RevealInNavigator, SaveAll, SaveFile,
     ShowChangesNavigator, ShowFilesNavigator, ShowSearchNavigator, StopBuild, ToggleInspector, ToggleNavigator,
-    ToggleTerminal, Zoom,
+    ToggleTerminal, TogglePreview, ImageZoomIn, ImageZoomOut, ImageZoomFit, Zoom,
 };
 
 pub struct Command {
@@ -37,6 +37,10 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "Show Changes Navigator", keys: "⌘3", action: || Box::new(ShowChangesNavigator) },
     Command { name: "Toggle Navigator", keys: "⌘B", action: || Box::new(ToggleNavigator) },
     Command { name: "Toggle Inspector", keys: "⌘R", action: || Box::new(ToggleInspector) },
+    Command { name: "Show Preview", keys: "⌥⌘↩", action: || Box::new(TogglePreview) },
+    Command { name: "Zoom In", keys: "⌘=", action: || Box::new(ImageZoomIn) },
+    Command { name: "Zoom Out", keys: "⌘-", action: || Box::new(ImageZoomOut) },
+    Command { name: "Zoom to Fit", keys: "", action: || Box::new(ImageZoomFit) },
     Command { name: "Toggle Terminal", keys: "⌘J", action: || Box::new(ToggleTerminal) },
     Command { name: "Focus Terminal", keys: "⌃`", action: || Box::new(FocusTerminal) },
     Command { name: "New Terminal", keys: "⌃⇧`", action: || Box::new(NewTerminal) },

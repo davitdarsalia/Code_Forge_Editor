@@ -1714,6 +1714,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "image",
  "libc",
  "lsp-types",
  "nucleo-matcher",

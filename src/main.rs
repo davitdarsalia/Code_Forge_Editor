@@ -7,6 +7,9 @@ mod build_panel;
 mod builtin_lang;
 mod clone_dialog;
 mod files;
+mod image_view;
+mod preview;
+mod preview_pane;
 mod diagnostics;
 mod document;
 mod format;
@@ -94,6 +97,10 @@ actions!(
         InstallBuild,
         Minimize,
         Zoom,
+        TogglePreview,
+        ImageZoomIn,
+        ImageZoomOut,
+        ImageZoomFit,
     ]
 );
 
@@ -333,6 +340,11 @@ pub fn set_menus(cx: &mut App) {
             ])),
             MenuItem::action("Toggle Navigator", ToggleNavigator),
             MenuItem::action("Toggle Inspector", ToggleInspector),
+            MenuItem::action("Show Preview", TogglePreview),
+            MenuItem::separator(),
+            MenuItem::action("Zoom In", ImageZoomIn),
+            MenuItem::action("Zoom Out", ImageZoomOut),
+            MenuItem::action("Zoom to Fit", ImageZoomFit),
             MenuItem::separator(),
             MenuItem::action("Toggle Terminal", ToggleTerminal),
             MenuItem::action("Focus Terminal", FocusTerminal),
@@ -457,6 +469,10 @@ fn register_actions(cx: &mut App) {
     cx.on_action(|_: &ShowChangesNavigator, cx| with_workspace(cx, |ws, window, cx| ws.show_navigator(2, window, cx)));
     cx.on_action(|_: &RevealInNavigator, cx| with_workspace(cx, |ws, _, cx| ws.reveal_active(cx)));
     cx.on_action(|_: &ToggleInspector, cx| with_workspace(cx, |ws, _, cx| ws.toggle_right(cx)));
+    cx.on_action(|_: &TogglePreview, cx| with_workspace(cx, |ws, _, cx| ws.toggle_preview(cx)));
+    cx.on_action(|_: &ImageZoomIn, cx| with_workspace(cx, |ws, _, cx| ws.zoom_image(workspace::ImageZoom::In, cx)));
+    cx.on_action(|_: &ImageZoomOut, cx| with_workspace(cx, |ws, _, cx| ws.zoom_image(workspace::ImageZoom::Out, cx)));
+    cx.on_action(|_: &ImageZoomFit, cx| with_workspace(cx, |ws, _, cx| ws.zoom_image(workspace::ImageZoom::Fit, cx)));
     cx.on_action(|_: &ToggleTerminal, cx| {
         with_workspace(cx, |ws, window, cx| ws.toggle_terminal(window, cx))
     });
@@ -547,6 +563,12 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-alt-p", GitPush, None),
         KeyBinding::new("cmd-alt-f", GitFetch, None),
         KeyBinding::new("cmd-m", Minimize, None),
+        KeyBinding::new("cmd-alt-enter", TogglePreview, None),
+        KeyBinding::new("cmd-=", ImageZoomIn, None),
+        KeyBinding::new("cmd-+", ImageZoomIn, None),
+        KeyBinding::new("cmd-shift-=", ImageZoomIn, None),
+        KeyBinding::new("cmd--", ImageZoomOut, None),
+        KeyBinding::new("cmd-0", ImageZoomFit, Some("ImageView")),
         KeyBinding::new("cmd-shift-f", FindInProject, Some("Input")),
         KeyBinding::new("cmd-.", StopBuild, Some("Input")),
     ]

@@ -26,6 +26,7 @@ pub struct Settings {
     pub open_last_project: bool,
     pub launch_full_screen: bool,
     pub icon_scale: f32,
+    pub preview_fraction: f32,
 }
 
 impl Default for Settings {
@@ -39,6 +40,7 @@ impl Default for Settings {
             open_last_project: true,
             launch_full_screen: true,
             icon_scale: crate::icons::DEFAULT_SCALE,
+            preview_fraction: crate::preview::DEFAULT_FRACTION,
         }
     }
 }
@@ -68,6 +70,7 @@ impl Settings {
         }
         let (lo, hi) = crate::icons::SCALE_RANGE;
         self.icon_scale = if self.icon_scale.is_finite() { self.icon_scale.clamp(lo, hi) } else { defaults.icon_scale };
+        self.preview_fraction = crate::preview::clamp_fraction(self.preview_fraction);
         self
     }
 
@@ -393,6 +396,7 @@ mod tests {
             open_last_project: false,
             launch_full_screen: false,
             icon_scale: 1.5,
+            preview_fraction: 0.35,
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), settings);
@@ -410,6 +414,14 @@ mod tests {
         save_generation(&path, &older, base + 1).unwrap();
         assert_eq!(load_from(&path), newer);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn preview_fraction_is_clamped_on_load() {
+        let wide = Settings::from_json(br#"{"preview_fraction": 3.0}"#);
+        assert_eq!(wide.preview_fraction, crate::preview::FRACTION_RANGE.1);
+        let narrow = Settings::from_json(br#"{"preview_fraction": -1.0}"#);
+        assert_eq!(narrow.preview_fraction, crate::preview::FRACTION_RANGE.0);
     }
 
     #[test]

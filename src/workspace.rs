@@ -18,6 +18,9 @@ use gpui_kit::{
 };
 
 use crate::file_icons;
+use crate::image_view::ImageView;
+use crate::preview::{self, FileKind};
+use crate::preview_pane::{PreviewKind, PreviewPane};
 use crate::build::BuildAction;
 use crate::clone_dialog::{CloneDialog, CloneEvent};
 use crate::rename::{self, RenameDialog, RenameEvent};
@@ -70,6 +73,7 @@ enum Drag {
     Left,
     Right,
     Bottom,
+    Preview,
 }
 
 struct RenameTarget {
@@ -93,9 +97,18 @@ struct Document {
     resave: bool,
     gate: Arc<files::WriteGate>,
     definitions: Option<Rc<lsp::Definitions>>,
+    preview: Option<Entity<PreviewPane>>,
+    image: Option<Entity<ImageView>>,
     _subscription: Subscription,
 }
 
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ImageZoom {
+    In,
+    Out,
+    Fit,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Navigator {
@@ -164,6 +177,9 @@ pub struct Workspace {
     left_width: f32,
     right_width: f32,
     terminal_height: f32,
+    show_preview: bool,
+    preview_fraction: f32,
+    split_bounds: Rc<std::cell::Cell<(f32, f32)>>,
     drag: Option<Drag>,
     focus: FocusHandle,
     tree_scroll: UniformListScrollHandle,
@@ -334,6 +350,9 @@ impl Workspace {
             left_width: 250.,
             right_width: 260.,
             terminal_height: 220.,
+            show_preview: true,
+            preview_fraction: Settings::get(cx).preview_fraction,
+            split_bounds: Rc::new(std::cell::Cell::new((0., 0.))),
             drag: None,
             focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
@@ -584,7 +603,13 @@ impl Workspace {
 
     fn focus_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.active.and_then(|ix| self.docs.get(ix)) {
-            Some(doc) => doc.editor.update(cx, |state, cx| state.focus(window, cx)),
+            Some(doc) => match doc.image.as_ref() {
+                Some(image) => {
+                    let focus = image.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
+                }
+                None => doc.editor.update(cx, |state, cx| state.focus(window, cx)),
+            },
             None => window.focus(&self.focus, cx),
         }
     }
@@ -602,6 +627,17 @@ impl Workspace {
     ) {
         if let Some(ix) = self.docs.iter().position(|d| d.path == path) {
             self.activate(ix, window, cx);
+            then(self, window, cx);
+            return;
+        }
+        if let FileKind::Raster(_) = preview::file_kind(path) {
+            let loaded = LoadedText {
+                text: String::new(),
+                saved_hash: document::hash_text(""),
+                language: files::language_for(path),
+                mtime: document::mtime(path),
+            };
+            self.finish_open(path, loaded, window, cx);
             then(self, window, cx);
             return;
         }
@@ -650,8 +686,28 @@ impl Workspace {
         });
         let id = self.next_doc_id;
         self.next_doc_id += 1;
+        let kind = preview::file_kind(path);
+        let image = match kind {
+            FileKind::Raster(format) => {
+                editor.update(cx, |state, cx| state.set_readonly(true, cx));
+                let file = path.to_path_buf();
+                Some(cx.new(|cx| ImageView::new(file, format, cx)))
+            }
+            _ => None,
+        };
+        let preview = match kind {
+            FileKind::Svg | FileKind::Markdown => {
+                let pane_kind = if kind == FileKind::Svg { PreviewKind::Svg } else { PreviewKind::Markdown };
+                let source = editor.clone();
+                Some(cx.new(|cx| PreviewPane::new(pane_kind, source, path, cx)))
+            }
+            _ => None,
+        };
         let subscription = cx.subscribe_in(&editor, window, move |this, _, event, _, cx| match event {
             InputEvent::Change => {
+                if let Some(pane) = this.docs.iter().find(|d| d.id == id).and_then(|d| d.preview.clone()) {
+                    pane.update(cx, |pane, cx| pane.content_changed(cx));
+                }
                 if let Some(definitions) = this.docs.iter().find(|d| d.id == id).and_then(|d| d.definitions.as_ref()) {
                     definitions.stale.set(true);
                 }
@@ -682,6 +738,8 @@ impl Workspace {
             resave: false,
             gate: Arc::new(files::WriteGate::default()),
             definitions,
+            preview,
+            image,
             _subscription: subscription,
         });
         if let Some(tree) = self.tree.as_mut() {
@@ -999,8 +1057,7 @@ impl Workspace {
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active = Some(ix);
-        let editor = self.docs[ix].editor.clone();
-        editor.update(cx, |state, cx| state.focus(window, cx));
+        self.focus_active_editor(window, cx);
         self.sync_lsp(self.docs[ix].id, cx);
         self.auto_reveal(cx);
         cx.notify();
@@ -1319,6 +1376,9 @@ impl Workspace {
                     let Some(text) = text else { continue };
                     doc.saved_hash = hash;
                     doc.editor.update(cx, |state, cx| state.set_value(text, window, cx));
+                    if let Some(pane) = doc.preview.as_ref() {
+                        pane.update(cx, |pane, cx| pane.content_changed(cx));
+                    }
                     if let Some(definitions) = doc.definitions.as_ref() {
                         definitions.stale.set(true);
                         reloaded.push(id);
@@ -2377,11 +2437,23 @@ impl Workspace {
     }
 
     fn render_editor_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        for (ix, doc) in self.docs.iter().enumerate() {
+            if let Some(pane) = doc.preview.as_ref() {
+                let visible = self.active == Some(ix) && self.show_preview;
+                pane.update(cx, |pane, cx| pane.set_visible(visible, cx));
+            }
+        }
         let content = match self.active.and_then(|ix| self.docs.get(ix)) {
+            Some(doc) if doc.image.is_some() => div()
+                .flex_1()
+                .min_h(px(0.))
+                .children(doc.image.clone())
+                .into_any_element(),
             Some(doc) => div()
                 .flex_1()
                 .min_h(px(0.))
                 .flex()
+                .relative()
                 .child(
                     div()
                         .flex_1()
@@ -2414,6 +2486,26 @@ impl Workspace {
                             el.child(diagnostics::overlay(doc.editor.clone(), marks, size))
                         }),
                 )
+                .when_some(doc.preview.clone().filter(|_| self.show_preview), |el, pane| {
+                    let bounds = self.split_bounds.clone();
+                    el.child(drag_handle("handle-preview", Drag::Preview, cx))
+                        .child(
+                            div()
+                                .flex_none()
+                                .h_full()
+                                .overflow_hidden()
+                                .w(gpui_kit::relative(preview::clamp_fraction(self.preview_fraction)))
+                                .child(pane),
+                        )
+                        .child(
+                            gpui_kit::canvas(
+                                move |area, _, _| bounds.set((f32::from(area.origin.x), f32::from(area.size.width))),
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                })
                 .into_any_element(),
             None => div()
                 .flex_1()
@@ -2959,11 +3051,35 @@ fn drag_handle(id: &'static str, drag: Drag, cx: &mut Context<Workspace>) -> imp
 }
 
 impl Workspace {
+    fn end_drag(&mut self, cx: &mut Context<Self>) {
+        if self.drag.take() == Some(Drag::Preview) {
+            let fraction = preview::clamp_fraction(self.preview_fraction);
+            self.preview_fraction = fraction;
+            crate::settings::update(cx, |settings| settings.preview_fraction = fraction);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        if self.active_doc().is_some_and(|doc| doc.preview.is_some()) {
+            self.show_preview = !self.show_preview;
+            cx.notify();
+        }
+    }
+
+    pub fn zoom_image(&mut self, change: ImageZoom, cx: &mut Context<Self>) {
+        let Some(image) = self.active_doc().and_then(|doc| doc.image.clone()) else { return };
+        image.update(cx, |view, cx| match change {
+            ImageZoom::In => view.zoom_in(cx),
+            ImageZoom::Out => view.zoom_out(cx),
+            ImageZoom::Fit => view.zoom_fit(cx),
+        });
+    }
+
     fn on_drag_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(drag) = self.drag else { return };
         if !event.dragging() {
-            self.drag = None;
-            cx.notify();
+            self.end_drag(cx);
             return;
         }
         let viewport = window.viewport_size();
@@ -2971,6 +3087,10 @@ impl Workspace {
         match drag {
             Drag::Left => self.left_width = x.clamp(160., 600.),
             Drag::Right => self.right_width = (f32::from(viewport.width) - x).clamp(180., 600.),
+            Drag::Preview => {
+                let (left, width) = self.split_bounds.get();
+                self.preview_fraction = preview::fraction_for_pointer(x, left, width);
+            }
             Drag::Bottom => {
                 let bottom = f32::from(viewport.height) - STATUS_HEIGHT;
                 self.terminal_height = (bottom - y).clamp(80., f32::from(viewport.height) - 200.);
@@ -3046,10 +3166,7 @@ impl Render for Workspace {
             .text_size(px(13.))
             .when(self.drag.is_some(), |el| {
                 el.on_mouse_move(cx.listener(Self::on_drag_move))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                        this.drag = None;
-                        cx.notify();
-                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.end_drag(cx)))
                     .map(|el| if self.drag == Some(Drag::Bottom) { el.cursor_row_resize() } else { el.cursor_col_resize() })
             })
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
