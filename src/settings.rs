@@ -22,6 +22,7 @@ pub struct Settings {
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
     pub soft_wrap: bool,
+    pub format_on_save: bool,
     pub show_inspector: bool,
     pub open_last_project: bool,
     pub launch_full_screen: bool,
@@ -36,6 +37,7 @@ impl Default for Settings {
             editor_font_size: 12.,
             terminal_font_size: 12.,
             soft_wrap: false,
+            format_on_save: true,
             show_inspector: true,
             open_last_project: true,
             launch_full_screen: true,
@@ -347,6 +349,7 @@ impl Render for SettingsView {
             .child(row("Autosave delay", number_field(&self.autosave, "ms")))
             .child(row("Editor font size", number_field(&self.editor_font, "pt")))
             .child(row("Soft wrap", toggle("soft-wrap", s.soft_wrap, |s, v| s.soft_wrap = v)))
+            .child(row("Format on save", toggle("format-on-save", s.format_on_save, |s, v| s.format_on_save = v)))
             .child(section("ICONS"))
             .child(row(
                 "Icon size",
@@ -392,6 +395,7 @@ mod tests {
             editor_font_size: 15.,
             terminal_font_size: 11.5,
             soft_wrap: true,
+            format_on_save: false,
             show_inspector: false,
             open_last_project: false,
             launch_full_screen: false,
@@ -428,6 +432,13 @@ mod tests {
     fn partial_json_fills_defaults() {
         let settings = Settings::from_json(br#"{"soft_wrap": true}"#);
         assert_eq!(settings, Settings { soft_wrap: true, ..Settings::default() });
+    }
+
+    #[test]
+    fn format_on_save_defaults_on_and_can_be_disabled() {
+        assert!(Settings::default().format_on_save);
+        assert!(Settings::from_json(b"{}").format_on_save);
+        assert!(!Settings::from_json(br#"{"format_on_save": false}"#).format_on_save);
     }
 
     #[test]

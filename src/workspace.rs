@@ -93,6 +93,7 @@ struct Document {
     save_seq: u64,
     applied_seq: u64,
     edit_gen: u64,
+    formatted_gen: u64,
     saving: bool,
     resave: bool,
     gate: Arc<files::WriteGate>,
@@ -161,6 +162,8 @@ pub struct Workspace {
     notice: Option<Notice>,
     notice_task: Option<Task<()>>,
     format_task: Option<Task<()>>,
+    close_task: Option<Task<()>>,
+    close_formatted: bool,
     reload_task: Option<Task<()>>,
     tree_task: Option<Task<()>>,
     reveal_task: Option<Task<()>>,
@@ -282,11 +285,11 @@ impl Workspace {
             }
         }));
         let weak = cx.weak_entity();
-        window.on_window_should_close(cx, move |_, cx| {
-            if let Some(workspace) = weak.upgrade() {
-                workspace.update(cx, |ws, cx| ws.save_all(true, cx));
+        window.on_window_should_close(cx, move |window, cx| {
+            match weak.upgrade() {
+                Some(workspace) => workspace.update(cx, |ws, cx| ws.should_close(window, cx)),
+                None => true,
             }
-            true
         });
         subscriptions.push(cx.on_app_quit(|this, cx| {
             this.save_all(true, cx);
@@ -334,6 +337,8 @@ impl Workspace {
             notice: None,
             notice_task: None,
             format_task: None,
+            close_task: None,
+            close_formatted: false,
             reload_task: None,
             tree_task: None,
             reveal_task: None,
@@ -741,6 +746,7 @@ impl Workspace {
             save_seq: 0,
             applied_seq: 0,
             edit_gen: 0,
+            formatted_gen: 0,
             saving: false,
             resave: false,
             gate: Arc::new(files::WriteGate::default()),
@@ -1113,8 +1119,17 @@ impl Workspace {
     pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.active else { return };
         let id = self.docs[ix].id;
+        self.after_format(vec![id], window, cx, move |this, window, cx| this.close_doc_by_id(id, window, cx));
+    }
+
+    fn close_doc_by_id(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         if !self.save_doc(id, false, cx) {
-            let name = self.docs[ix].path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = self
+                .docs
+                .iter()
+                .find(|d| d.id == id)
+                .and_then(|d| d.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_default();
             let answer = window.prompt(
                 PromptLevel::Warning,
                 &format!("“{name}” was not saved"),
@@ -1167,6 +1182,11 @@ impl Workspace {
     }
 
     fn close_ids(&mut self, ids: Vec<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = ids.clone();
+        self.after_format(pending, window, cx, move |this, window, cx| this.close_ids_now(ids, window, cx));
+    }
+
+    fn close_ids_now(&mut self, ids: Vec<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let mut unsaved = Vec::new();
         let mut closing = Vec::new();
         for id in ids {
@@ -1400,6 +1420,160 @@ impl Workspace {
         }));
     }
 
+    fn replace_minimal(
+        editor: &Entity<EditorState>,
+        expected: &str,
+        formatted: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        editor.update(cx, |state, cx| {
+            let current = state.text().to_string();
+            if current != expected {
+                return false;
+            }
+            let Some(edit) = crate::format::minimal_edit(&current, formatted) else { return true };
+            let selection = state.selected_range();
+            let scroll = state.scroll_offset();
+            let point = |offset: usize| {
+                let (line, character) = crate::format::position_at(&current, offset);
+                lsp_types::Position { line, character }
+            };
+            let change = lsp_types::TextEdit {
+                range: lsp_types::Range { start: point(edit.start), end: point(edit.end) },
+                new_text: edit.text.clone(),
+            };
+            state.apply_lsp_edits(&vec![change], window, cx);
+            state.set_selected_range(edit.map_offset(selection.start)..edit.map_offset(selection.end), cx);
+            state.set_scroll_offset(scroll, cx);
+            true
+        })
+    }
+
+    fn format_before_save(&mut self, ids: &[usize], window: &mut Window, cx: &mut Context<Self>) -> Option<Task<()>> {
+        if !Settings::get(cx).format_on_save {
+            return None;
+        }
+        let jobs: Vec<(usize, PathBuf, String, u64)> = ids
+            .iter()
+            .filter_map(|id| self.docs.iter().find(|d| d.id == *id))
+            .filter(|d| d.edit_gen != d.formatted_gen && crate::format::builtin_for(&d.path).is_some())
+            .map(|d| (d.id, d.path.clone(), d.editor.read(cx).value().to_string(), d.edit_gen))
+            .collect();
+        if jobs.is_empty() {
+            return None;
+        }
+        Some(cx.spawn_in(window, async move |this, cx| {
+            let running: Vec<_> = jobs
+                .into_iter()
+                .map(|(id, path, text, generation)| {
+                    let source = text.clone();
+                    let task = cx.background_spawn(async move { crate::format::format_on_save(&path, &text) });
+                    (id, generation, source, task)
+                })
+                .collect();
+            for (id, generation, source, task) in running {
+                let outcome = task.await;
+                let applied = this
+                    .update_in(cx, |this, window, cx| this.apply_save_format(id, generation, &source, outcome, window, cx))
+                    .unwrap_or(false);
+                if applied {
+                    let _ = this.update(cx, |this, _| {
+                        if let Some(doc) = this.docs.iter_mut().find(|d| d.id == id) {
+                            doc.formatted_gen = doc.edit_gen;
+                        }
+                    });
+                }
+            }
+        }))
+    }
+
+    fn apply_save_format(
+        &mut self,
+        id: usize,
+        generation: u64,
+        source: &str,
+        outcome: Option<crate::format::Outcome>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::format::Outcome;
+        let Some(doc) = self.docs.iter_mut().find(|d| d.id == id) else { return false };
+        let editor = doc.editor.clone();
+        let unchanged_since = doc.edit_gen == generation;
+        let formatted = match outcome {
+            Some(Outcome::Changed { text, .. }) => text,
+            Some(Outcome::Unchanged { .. }) | None => {
+                if unchanged_since {
+                    doc.formatted_gen = generation;
+                }
+                return false;
+            }
+            Some(Outcome::Failed(message)) => {
+                self.notify_error(message, cx);
+                return false;
+            }
+        };
+        if !unchanged_since {
+            return false;
+        }
+        Self::replace_minimal(&editor, source, &formatted, window, cx)
+    }
+
+    fn after_format(
+        &mut self,
+        ids: Vec<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        match self.format_before_save(&ids, window, cx) {
+            None => then(self, window, cx),
+            Some(task) => cx
+                .spawn_in(window, async move |this, cx| {
+                    task.await;
+                    let _ = this.update_in(cx, |this, window, cx| then(this, window, cx));
+                })
+                .detach(),
+        }
+    }
+
+    pub fn save_all_formatted(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
+        let ids: Vec<usize> = self.docs.iter().map(|d| d.id).collect();
+        match self.format_before_save(&ids, window, cx) {
+            None => {
+                self.save_all(force, cx);
+                Task::ready(())
+            }
+            Some(task) => cx.spawn(async move |this, cx| {
+                task.await;
+                let _ = this.update(cx, |this, cx| this.save_all(force, cx));
+            }),
+        }
+    }
+
+    fn should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.close_formatted {
+            self.save_all(true, cx);
+            return true;
+        }
+        let ids: Vec<usize> = self.docs.iter().map(|d| d.id).collect();
+        let Some(task) = self.format_before_save(&ids, window, cx) else {
+            self.save_all(true, cx);
+            return true;
+        };
+        self.close_task = Some(cx.spawn_in(window, async move |this, cx| {
+            task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.save_all(true, cx);
+                this.close_formatted = true;
+                this.close_task = None;
+                window.remove_window();
+            });
+        }));
+        false
+    }
+
     pub fn format_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = self.active_doc() else { return };
         let (id, path) = (doc.id, doc.path.clone());
@@ -1407,10 +1581,11 @@ impl Workspace {
         let language = files::language_for(&path);
         let before = doc.edit_gen;
         self.format_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let source = text.clone();
             let outcome = cx
                 .background_spawn(async move { crate::format::format(&path, language, &text) })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| this.apply_format(id, before, outcome, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| this.apply_format(id, before, source, outcome, window, cx));
         }));
     }
 
@@ -1418,6 +1593,7 @@ impl Workspace {
         &mut self,
         id: usize,
         before: u64,
+        before_text: String,
         outcome: crate::format::Outcome,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1444,13 +1620,11 @@ impl Workspace {
             self.notify_info("File changed while formatting; press ⌘I again", cx);
             return;
         }
-        editor.update(cx, |state, cx| {
-            let cursor = state.cursor_position();
-            state.replace_all(text.clone(), window, cx);
-            let last_line = text.split('\n').count().saturating_sub(1) as u32;
-            let line = cursor.line.min(last_line);
-            state.set_cursor_position(Position { line, character: cursor.character }, window, cx);
-        });
+        let expected = before_text;
+        if !Self::replace_minimal(&editor, &expected, &text, window, cx) {
+            self.notify_info("File changed while formatting; press ⌘I again", cx);
+            return;
+        }
         self.schedule_save(id, cx);
         if let Some(notice) = notice {
             self.notify_info(notice, cx);

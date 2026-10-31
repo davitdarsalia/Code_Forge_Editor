@@ -392,12 +392,21 @@ fn register_actions(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| {
         cx.defer(|cx| {
             let windows = cx.try_global::<AppState>().map(|s| s.windows.clone()).unwrap_or_default();
+            let pending = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             for target in windows.into_iter().filter(|(_, ws)| ws.upgrade().is_some()) {
-                update_workspace(cx, target, |ws, _, cx| {
-                    ws.save_all(true, cx);
+                let pending = pending.clone();
+                update_workspace(cx, target, move |ws, window, cx| {
+                    pending.borrow_mut().push(ws.save_all_formatted(true, window, cx));
                 });
             }
-            cx.quit();
+            let tasks = std::mem::take(&mut *pending.borrow_mut());
+            cx.spawn(async move |cx| {
+                for task in tasks {
+                    task.await;
+                }
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
         });
     });
     cx.on_action(|_: &NewWindow, cx| {
@@ -449,11 +458,11 @@ fn register_actions(cx: &mut App) {
     cx.on_action(|_: &CloneRepository, cx| {
         with_workspace_or_new(cx, |ws, window, cx| ws.show_clone(window, cx))
     });
-    cx.on_action(|_: &SaveFile, cx| with_workspace(cx, |ws, _, cx| {
-        ws.save_all(true, cx);
+    cx.on_action(|_: &SaveFile, cx| with_workspace(cx, |ws, window, cx| {
+        ws.save_all_formatted(true, window, cx).detach();
     }));
-    cx.on_action(|_: &SaveAll, cx| with_workspace(cx, |ws, _, cx| {
-        ws.save_all(true, cx);
+    cx.on_action(|_: &SaveAll, cx| with_workspace(cx, |ws, window, cx| {
+        ws.save_all_formatted(true, window, cx).detach();
     }));
     cx.on_action(|_: &CloseTab, cx| {
         if !close_settings_if_active(cx) {
