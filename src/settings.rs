@@ -23,11 +23,16 @@ pub struct Settings {
     pub terminal_font_size: f32,
     pub soft_wrap: bool,
     pub format_on_save: bool,
-    pub show_inspector: bool,
+    #[serde(alias = "show_inspector")]
+    pub show_agent_panel: bool,
     pub open_last_project: bool,
     pub launch_full_screen: bool,
     pub icon_scale: f32,
     pub preview_fraction: f32,
+    pub agent: String,
+    pub agent_panel_width: f32,
+    pub agent_full_access: bool,
+    pub agents: Vec<crate::agent::registry::CustomAgent>,
 }
 
 impl Default for Settings {
@@ -38,11 +43,15 @@ impl Default for Settings {
             terminal_font_size: 12.,
             soft_wrap: false,
             format_on_save: true,
-            show_inspector: true,
+            show_agent_panel: false,
             open_last_project: true,
             launch_full_screen: true,
             icon_scale: crate::icons::DEFAULT_SCALE,
             preview_fraction: crate::preview::DEFAULT_FRACTION,
+            agent: crate::agent::registry::DEFAULT_AGENT.into(),
+            agent_panel_width: AGENT_WIDTH_DEFAULT,
+            agent_full_access: false,
+            agents: Vec::new(),
         }
     }
 }
@@ -51,6 +60,8 @@ impl Global for Settings {}
 
 pub const AUTOSAVE_RANGE: (u64, u64) = (50, 10_000);
 pub const FONT_RANGE: (f32, f32) = (8., 32.);
+pub const AGENT_WIDTH_RANGE: (f32, f32) = (260., 720.);
+pub const AGENT_WIDTH_DEFAULT: f32 = 360.;
 
 impl Settings {
     pub fn get(cx: &App) -> &Settings {
@@ -73,6 +84,14 @@ impl Settings {
         let (lo, hi) = crate::icons::SCALE_RANGE;
         self.icon_scale = if self.icon_scale.is_finite() { self.icon_scale.clamp(lo, hi) } else { defaults.icon_scale };
         self.preview_fraction = crate::preview::clamp_fraction(self.preview_fraction);
+        self.agent_panel_width = if self.agent_panel_width.is_finite() {
+            self.agent_panel_width.clamp(AGENT_WIDTH_RANGE.0, AGENT_WIDTH_RANGE.1)
+        } else {
+            defaults.agent_panel_width
+        };
+        if self.agent.trim().is_empty() {
+            self.agent = defaults.agent;
+        }
         self
     }
 
@@ -369,8 +388,10 @@ impl Render for SettingsView {
             .child(icon_preview())
             .child(section("TERMINAL"))
             .child(row("Terminal font size", number_field(&self.terminal_font, "pt")))
+            .child(section("AGENT"))
+            .child(row("Show agent panel by default", toggle("show-agent", s.show_agent_panel, |s, v| s.show_agent_panel = v)))
+            .child(row("Full access (auto-approve tools)", toggle("agent-full-access", s.agent_full_access, |s, v| s.agent_full_access = v)))
             .child(section("WINDOW"))
-            .child(row("Show inspector by default", toggle("show-inspector", s.show_inspector, |s, v| s.show_inspector = v)))
             .child(row("Open last project on launch", toggle("open-last", s.open_last_project, |s, v| s.open_last_project = v)))
             .child(row("Launch full screen", toggle("full-screen", s.launch_full_screen, |s, v| s.launch_full_screen = v)))
     }
@@ -396,11 +417,20 @@ mod tests {
             terminal_font_size: 11.5,
             soft_wrap: true,
             format_on_save: false,
-            show_inspector: false,
+            show_agent_panel: true,
             open_last_project: false,
             launch_full_screen: false,
             icon_scale: 1.5,
             preview_fraction: 0.35,
+            agent: "gemini".into(),
+            agent_panel_width: 420.,
+            agent_full_access: true,
+            agents: vec![crate::agent::registry::CustomAgent {
+                name: "Local".into(),
+                command: "/usr/local/bin/my-agent".into(),
+                args: vec!["--acp".into()],
+                env: [("MODE".to_string(), "fast".to_string())].into_iter().collect(),
+            }],
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), settings);
@@ -451,6 +481,23 @@ mod tests {
         let settings = Settings::from_json(br#"{"autosave_delay_ms": 0, "editor_font_size": 400}"#);
         assert_eq!(settings.autosave_delay_ms, AUTOSAVE_RANGE.0);
         assert_eq!(settings.editor_font_size, FONT_RANGE.1);
+    }
+
+    #[test]
+    fn agent_settings_default_and_migrate() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.agent, crate::agent::registry::DEFAULT_AGENT);
+        assert!(!defaults.agent_full_access);
+        assert!(!defaults.show_agent_panel);
+        let old = Settings::from_json(br#"{"show_inspector": true, "agent": "  ", "agent_panel_width": 5000}"#);
+        assert!(old.show_agent_panel);
+        assert_eq!(old.agent, crate::agent::registry::DEFAULT_AGENT);
+        assert_eq!(old.agent_panel_width, AGENT_WIDTH_RANGE.1);
+        let custom = Settings::from_json(
+            br#"{"agents": [{"name": "Mine", "command": "mine", "args": ["acp"], "env": {"X": "1"}}]}"#,
+        );
+        assert_eq!(custom.agents.len(), 1);
+        assert_eq!(custom.agents[0].env.get("X").map(String::as_str), Some("1"));
     }
 
     #[test]

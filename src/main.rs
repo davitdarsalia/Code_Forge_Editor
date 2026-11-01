@@ -2,6 +2,7 @@ extern crate gpui_kit as gpui;
 
 mod file_icons;
 mod commands;
+mod agent;
 mod build;
 mod build_panel;
 mod builtin_lang;
@@ -77,7 +78,8 @@ actions!(
         ShowSearchNavigator,
         ShowChangesNavigator,
         RevealInNavigator,
-        ToggleInspector,
+        ToggleAgentPanel,
+        FocusAgent,
         ToggleTerminal,
         FocusTerminal,
         NewTerminal,
@@ -345,7 +347,8 @@ pub fn set_menus(cx: &mut App) {
                 MenuItem::action("Show Changes Navigator", ShowChangesNavigator),
             ])),
             MenuItem::action("Toggle Navigator", ToggleNavigator),
-            MenuItem::action("Toggle Inspector", ToggleInspector),
+            MenuItem::action("Toggle Agent Panel", ToggleAgentPanel),
+            MenuItem::action("Focus Agent", FocusAgent),
             MenuItem::action("Show Preview", TogglePreview),
             MenuItem::separator(),
             MenuItem::action("Zoom In", ImageZoomIn),
@@ -483,7 +486,8 @@ fn register_actions(cx: &mut App) {
     cx.on_action(|_: &ShowSearchNavigator, cx| with_workspace(cx, |ws, window, cx| ws.show_navigator(1, window, cx)));
     cx.on_action(|_: &ShowChangesNavigator, cx| with_workspace(cx, |ws, window, cx| ws.show_navigator(2, window, cx)));
     cx.on_action(|_: &RevealInNavigator, cx| with_workspace(cx, |ws, _, cx| ws.reveal_active(cx)));
-    cx.on_action(|_: &ToggleInspector, cx| with_workspace(cx, |ws, _, cx| ws.toggle_right(cx)));
+    cx.on_action(|_: &ToggleAgentPanel, cx| with_workspace(cx, |ws, _, cx| ws.toggle_right(cx)));
+    cx.on_action(|_: &FocusAgent, cx| with_workspace(cx, |ws, window, cx| ws.focus_agent(window, cx)));
     cx.on_action(|_: &TogglePreview, cx| with_workspace(cx, |ws, _, cx| ws.toggle_preview(cx)));
     cx.on_action(|_: &ImageZoomIn, cx| with_workspace(cx, |ws, _, cx| ws.zoom_image(workspace::ImageZoom::In, cx)));
     cx.on_action(|_: &ImageZoomOut, cx| with_workspace(cx, |ws, _, cx| ws.zoom_image(workspace::ImageZoom::Out, cx)));
@@ -559,8 +563,9 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("f2", RenameSymbol, None),
         KeyBinding::new("ctrl-cmd-left", GoBack, None),
         KeyBinding::new("ctrl-cmd-right", GoForward, None),
-        KeyBinding::new("cmd-r", ToggleInspector, None),
-        KeyBinding::new("cmd-alt-0", ToggleInspector, None),
+        KeyBinding::new("cmd-r", ToggleAgentPanel, None),
+        KeyBinding::new("cmd-alt-0", ToggleAgentPanel, None),
+        KeyBinding::new("cmd-l", FocusAgent, None),
         KeyBinding::new("cmd-j", ToggleTerminal, None),
         KeyBinding::new("cmd-shift-y", ToggleTerminal, None),
         KeyBinding::new("ctrl-`", FocusTerminal, None),

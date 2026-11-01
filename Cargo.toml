@@ -63,6 +63,7 @@ dprint-plugin-markdown = { version = "0.28.2", default-features = false }
 malva = { version = "0.16.0", default-features = false }
 markup_fmt = { version = "0.27.6", default-features = false }
 taplo = { version = "0.14.0", default-features = false }
+similar = "2.7"
 
 [build-dependencies]
 cc = "1"

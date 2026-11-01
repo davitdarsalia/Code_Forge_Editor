@@ -1,6 +1,11 @@
 # Claude integration plan for Forge
 
-Status: research only, nothing implemented. Researched 2026-10-29. Versions below come from
+Status: phase 1 implemented on `agent/ai-panel` (2026-11-01): ACP client in `src/agent/`, Agent panel in the
+right sidebar (⌘R, ⌘L focuses the input). The `agent-client-protocol` crate was not used: its
+`serde_json` features (`preserve_order`, `raw_value`) and `serde/rc` change feature unification for the whole
+GPUI stack (full rebuild, and `preserve_order` changes JSON behaviour app-wide), so `src/agent/protocol.rs`
+implements the v1 wire format (initialize, session/new|prompt|cancel|set_mode|set_config_option, session/update,
+request_permission, fs/*, terminal/*) on serde_json directly. Researched 2026-10-29. Versions below come from
 `cargo search`/`cargo info`/`npm view` on that date; re-check before adding anything.
 
 Goal: put Claude into Forge without breaking the product promises (Sublime-fast startup, tiny RAM,

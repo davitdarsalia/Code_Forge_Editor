@@ -4,7 +4,7 @@ use crate::{
     Build, ClearRecent, CleanBuild, CloneRepository, CloseTab, CloseOtherTabs, CloseTabsToRight, CloseTabsToLeft, CloseSavedTabs, CloseAllTabs, CopyPath, CopyRelativePath, FindInProject, FocusCommit, FocusTerminal,
     FormatFile, GitFetch, GoBack, GoForward, JumpToDefinition, GitPull, GitPush, InstallBuild, Minimize, NewFile, NewTerminal, NewWindow, NextTab,
     OpenFolder, OpenSettings, PreviousTab, QuickOpenFile, RenameSymbol, Quit, RevealInNavigator, SaveAll, SaveFile,
-    ShowChangesNavigator, ShowFilesNavigator, ShowSearchNavigator, StopBuild, ToggleInspector, ToggleNavigator,
+    ShowChangesNavigator, ShowFilesNavigator, ShowSearchNavigator, StopBuild, ToggleAgentPanel, FocusAgent, ToggleNavigator,
     ToggleTerminal, TogglePreview, ImageZoomIn, ImageZoomOut, ImageZoomFit, Zoom,
 };
 
@@ -36,7 +36,8 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "Show Search Navigator", keys: "⌘2", action: || Box::new(ShowSearchNavigator) },
     Command { name: "Show Changes Navigator", keys: "⌘3", action: || Box::new(ShowChangesNavigator) },
     Command { name: "Toggle Navigator", keys: "⌘B", action: || Box::new(ToggleNavigator) },
-    Command { name: "Toggle Inspector", keys: "⌘R", action: || Box::new(ToggleInspector) },
+    Command { name: "Toggle Agent Panel", keys: "⌘R", action: || Box::new(ToggleAgentPanel) },
+    Command { name: "Focus Agent", keys: "⌘L", action: || Box::new(FocusAgent) },
     Command { name: "Show Preview", keys: "⌥⌘↩", action: || Box::new(TogglePreview) },
     Command { name: "Zoom In", keys: "⌘=", action: || Box::new(ImageZoomIn) },
     Command { name: "Zoom Out", keys: "⌘-", action: || Box::new(ImageZoomOut) },

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{
-    DefinitionProvider as _, Editor, EditorState, Input, InputEvent, InputState, Position, RopeExt as _,
-    ShowDocumentHandler,
+    DefinitionProvider as _, Editor, EditorState, Input, InputEvent, InputState, Position, RangeDecoration,
+    RangeDecorationCollection, RangeDecorationStyle, RopeExt as _, ShowDocumentHandler,
 };
 use gpui_kit::base::{Spring, spring};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
@@ -17,6 +17,8 @@ use gpui_kit::{
     ScrollStrategy, UniformListScrollHandle, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 
+use crate::agent::glow::AgentGlow;
+use crate::agent::panel::{AgentPanel, Attachment, PanelEvent};
 use crate::file_icons;
 use crate::image_view::ImageView;
 use crate::preview::{self, FileKind};
@@ -97,6 +99,9 @@ struct Document {
     saving: bool,
     resave: bool,
     gate: Arc<files::WriteGate>,
+    ai_marks: Option<RangeDecorationCollection>,
+    ai_hash: Option<u64>,
+    ai_unseen: bool,
     definitions: Option<Rc<lsp::Definitions>>,
     preview: Option<Entity<PreviewPane>>,
     image: Option<Entity<ImageView>>,
@@ -195,6 +200,9 @@ pub struct Workspace {
     _lsp_events: Task<()>,
     back: Vec<NavPoint>,
     forward: Vec<NavPoint>,
+    agent: Option<Entity<AgentPanel>>,
+    glow: Option<Entity<AgentGlow>>,
+    _agent_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -317,7 +325,7 @@ impl Workspace {
             next_doc_id: 0,
             navigator: Navigator::Files,
             show_left: true,
-            show_right: Settings::get(cx).show_inspector,
+            show_right: Settings::get(cx).show_agent_panel,
             show_terminal: true,
             terminal: None,
             bottom_tab: BottomTab::Terminal,
@@ -354,7 +362,7 @@ impl Workspace {
             quick_open,
             quick_open_visible: false,
             left_width: 250.,
-            right_width: 260.,
+            right_width: Settings::get(cx).agent_panel_width,
             terminal_height: 220.,
             show_preview: true,
             preview_fraction: Settings::get(cx).preview_fraction,
@@ -370,6 +378,9 @@ impl Workspace {
             _lsp_events: lsp_events,
             back: Vec::new(),
             forward: Vec::new(),
+            agent: None,
+            glow: None,
+            _agent_subscription: None,
             _subscriptions: subscriptions,
         }
     }
@@ -417,6 +428,10 @@ impl Workspace {
         self.rebuild_rows();
         crate::startup::mark("open_project: tree root loaded");
         self.root = Some(root.clone());
+        if let Some(agent) = self.agent.clone() {
+            let root = Some(root.clone());
+            agent.update(cx, |agent, cx| agent.set_root(root, cx));
+        }
         self.recent = recent::push(&root);
         cx.on_next_frame(window, |_, _, cx| crate::set_menus(cx));
         crate::startup::mark("open_project: recent + menus");
@@ -711,6 +726,7 @@ impl Workspace {
         };
         let subscription = cx.subscribe_in(&editor, window, move |this, _, event, _, cx| match event {
             InputEvent::Change => {
+                this.clear_ai_marks_on_user_edit(id, cx);
                 if let Some(pane) = this.docs.iter().find(|d| d.id == id).and_then(|d| d.preview.clone()) {
                     pane.update(cx, |pane, cx| pane.content_changed(cx));
                 }
@@ -750,6 +766,9 @@ impl Workspace {
             saving: false,
             resave: false,
             gate: Arc::new(files::WriteGate::default()),
+            ai_marks: None,
+            ai_hash: None,
+            ai_unseen: false,
             definitions,
             preview,
             image,
@@ -1071,6 +1090,7 @@ impl Workspace {
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active = Some(ix);
+        self.docs[ix].ai_unseen = false;
         self.focus_active_editor(window, cx);
         self.sync_lsp(self.docs[ix].id, cx);
         self.auto_reveal(cx);
@@ -1539,6 +1559,7 @@ impl Workspace {
     }
 
     pub fn save_all_formatted(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
+        self.clear_all_ai_marks(cx);
         let ids: Vec<usize> = self.docs.iter().map(|d| d.id).collect();
         match self.format_before_save(&ids, window, cx) {
             None => {
@@ -1820,6 +1841,13 @@ impl Workspace {
 
     pub fn toggle_right(&mut self, cx: &mut Context<Self>) {
         self.show_right = !self.show_right;
+        cx.notify();
+    }
+
+    pub fn focus_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_right = true;
+        let agent = self.ensure_agent(window, cx);
+        agent.update(cx, |agent, cx| agent.focus_input(window, cx));
         cx.notify();
     }
 
@@ -2550,6 +2578,7 @@ impl Workspace {
                     .when(!active, |el| el.text_color(Palette::muted()).hover(|s| s.bg(Palette::row_hover())))
                     .child(file_icons::file_icon_img(&doc.path))
                     .child(name)
+                    .when(doc.ai_unseen, |el| el.child(crate::agent::glow::sparkle_dot()))
                     .child(
                         div()
                             .id(("tab-close", ix))
@@ -2670,6 +2699,9 @@ impl Workspace {
                         .when_some(self.issues.marks(&doc.path), |el, marks| {
                             let size = px((Settings::get(cx).editor_font_size * 0.9).round());
                             el.child(diagnostics::overlay(doc.editor.clone(), marks, size))
+                        })
+                        .when_some(self.glow.clone().filter(|glow| glow.read(cx).is_showing(&doc.path)), |el, glow| {
+                            el.child(div().absolute().top_0().left_0().size_full().child(glow))
                         }),
                 )
                 .when_some(doc.preview.clone().filter(|_| self.show_preview), |el, pane| {
@@ -2795,95 +2827,6 @@ impl Workspace {
                 }
                 cx.notify();
             }))
-    }
-
-    fn render_inspector(&self, cx: &App) -> impl IntoElement {
-        let doc = self.active.and_then(|ix| self.docs.get(ix));
-        let field = |label: &'static str, value: String| {
-            div()
-                .px(px(12.))
-                .py(px(3.))
-                .flex()
-                .flex_col()
-                .child(div().text_size(px(10.5)).text_color(Palette::faint()).child(label))
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(Palette::text())
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(value),
-                )
-        };
-        let mut panel = div()
-            .id("inspector")
-            .size_full()
-            .flex()
-            .flex_col()
-            .overflow_y_scroll()
-            .bg(Palette::sidebar_bg());
-
-        panel = panel.child(section_header("FILE"));
-        panel = match doc {
-            Some(doc) => {
-                let state = doc.editor.read(cx);
-                let text = state.text();
-                let lines = gpui_kit::component::RopeExt::lines_len(text);
-                let bytes = text.len();
-                let cursor = state.cursor_position();
-                let relative = self
-                    .root
-                    .as_ref()
-                    .and_then(|root| doc.path.strip_prefix(root).ok())
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| doc.path.display().to_string());
-                panel
-                    .child(field("Name", doc.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()))
-                    .child(field("Path", relative))
-                    .child(field("Type", files::language_for(&doc.path).to_string()))
-                    .child(field("Size", format_bytes(bytes)))
-                    .child(field("Lines", lines.to_string()))
-                    .child(field("Cursor", format!("Ln {}, Col {}", cursor.line + 1, cursor.character + 1)))
-                    .child(field("Autosave", if doc.dirty { "Pending…".into() } else { "Saved".into() }))
-            }
-            None => panel.child(
-                div().px(px(12.)).text_size(px(12.)).text_color(Palette::faint()).child("No Selection"),
-            ),
-        };
-
-        if let Some(repo) = self.repo.as_ref() {
-            panel = panel.child(section_header("HISTORY")).children(repo.log.iter().map(|commit| {
-                div()
-                    .mx(px(6.))
-                    .px(px(6.))
-                    .py(px(5.))
-                    .rounded(px(5.))
-                    .hover(|s| s.bg(Palette::row_hover()))
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(Palette::text())
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(commit.subject.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(6.))
-                            .text_size(px(10.5))
-                            .text_color(Palette::faint())
-                            .child(div().font_family(crate::theme::mono_font()).child(commit.hash.clone()))
-                            .child(commit.author.clone())
-                            .child(commit.when.clone()),
-                    )
-            }));
-        }
-        panel
     }
 
     fn render_index_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3057,6 +3000,11 @@ impl Workspace {
             })
             .child(div().flex_1())
             .when_some(image_status, |el, status| el.child(status.dimensions).child(status.size).child(status.zoom))
+            .when_some(doc.filter(|_| !raster), |el, doc| {
+                let text = doc.editor.read(cx).text();
+                let lines = gpui_kit::component::RopeExt::lines_len(text);
+                el.child(format!("{lines} lines · {}", format_bytes(text.len())))
+            })
             .when_some(cursor, |el, cursor| {
                 el.child(format!("Ln {}, Col {}", cursor.line + 1, cursor.character + 1))
             })
@@ -3242,10 +3190,17 @@ fn drag_handle(id: &'static str, drag: Drag, cx: &mut Context<Workspace>) -> imp
 
 impl Workspace {
     fn end_drag(&mut self, cx: &mut Context<Self>) {
-        if self.drag.take() == Some(Drag::Preview) {
-            let fraction = preview::clamp_fraction(self.preview_fraction);
-            self.preview_fraction = fraction;
-            crate::settings::update(cx, |settings| settings.preview_fraction = fraction);
+        match self.drag.take() {
+            Some(Drag::Preview) => {
+                let fraction = preview::clamp_fraction(self.preview_fraction);
+                self.preview_fraction = fraction;
+                crate::settings::update(cx, |settings| settings.preview_fraction = fraction);
+            }
+            Some(Drag::Right) => {
+                let width = self.right_width;
+                crate::settings::update(cx, |settings| settings.agent_panel_width = width);
+            }
+            _ => {}
         }
         cx.notify();
     }
@@ -3283,7 +3238,10 @@ impl Workspace {
         let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
         match drag {
             Drag::Left => self.left_width = x.clamp(160., 600.),
-            Drag::Right => self.right_width = (f32::from(viewport.width) - x).clamp(180., 600.),
+            Drag::Right => {
+                let (lo, hi) = crate::settings::AGENT_WIDTH_RANGE;
+                self.right_width = (f32::from(viewport.width) - x).clamp(lo, hi);
+            }
             Drag::Preview => {
                 let (left, width) = self.split_bounds.get();
                 self.preview_fraction = preview::fraction_for_pointer(x, left, width);
@@ -3315,6 +3273,9 @@ impl Render for Workspace {
             self.render_welcome(cx).into_any_element()
         } else {
             let left = self.panel_size("left-panel", self.show_left, self.left_width, Drag::Left, window, cx);
+            if self.show_right && self.agent.is_none() {
+                self.ensure_agent(window, cx);
+            }
             let right = self.panel_size("right-panel", self.show_right, self.right_width, Drag::Right, window, cx);
             let bottom = self.panel_size("bottom-panel", self.show_terminal, self.terminal_height, Drag::Bottom, window, cx);
             let slide = |size: f32, full: f32, horizontal: bool, content: AnyElement| {
@@ -3346,7 +3307,10 @@ impl Render for Workspace {
                 .when(left > 0.5, |el| el.child(drag_handle("handle-left", Drag::Left, cx)))
                 .child(center)
                 .when(right > 0.5, |el| el.child(drag_handle("handle-right", Drag::Right, cx)))
-                .child(slide(right, self.right_width, true, self.render_inspector(cx).into_any_element()))
+                .child(slide(right, self.right_width, true, match self.agent.clone() {
+                    Some(agent) => agent.into_any_element(),
+                    None => div().size_full().bg(Palette::sidebar_bg()).into_any_element(),
+                }))
                 .into_any_element()
         };
 
@@ -3493,5 +3457,202 @@ mod tab_close_tests {
     fn all_closes_everything() {
         assert_eq!(tabs_to_close(CloseKind::All, 3, &DIRTY), vec![0, 1, 2, 3, 4]);
         assert!(tabs_to_close(CloseKind::All, 0, &[]).is_empty());
+    }
+}
+
+impl Workspace {
+    fn ensure_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<AgentPanel> {
+        if let Some(agent) = self.agent.clone() {
+            return agent;
+        }
+        let root = self.root.clone();
+        let agent = cx.new(|cx| AgentPanel::new(root, window, cx));
+        self._agent_subscription = Some(cx.subscribe_in(&agent, window, |this, _, event, window, cx| {
+            this.on_agent_event(event, window, cx)
+        }));
+        self.agent = Some(agent.clone());
+        agent
+    }
+
+    fn on_agent_event(&mut self, event: &PanelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            PanelEvent::Read { path, line, limit, reply } => {
+                if let Some(reply) = reply.borrow_mut().take() {
+                    self.agent_read(path.clone(), *line, *limit, reply, cx);
+                }
+            }
+            PanelEvent::Write { path, content, reply } => {
+                if let Some(reply) = reply.borrow_mut().take() {
+                    self.agent_write(path.clone(), content.clone(), reply, window, cx);
+                }
+            }
+            PanelEvent::Open { path, line } => {
+                let line = line.map(|l| l.saturating_sub(1)).unwrap_or(0);
+                self.open_at(path, line, 0, window, cx);
+            }
+            PanelEvent::Editing(path) => {
+                if self.active_doc().is_some_and(|doc| &doc.path == path) {
+                    self.pulse_glow(path, cx);
+                }
+            }
+            PanelEvent::AttachCurrent => self.attach_current(cx),
+            PanelEvent::FocusEditor => self.focus_active_editor(window, cx),
+        }
+    }
+
+    fn attach_current(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = self.active_doc().filter(|doc| doc.image.is_none()) else {
+            self.notify_info("Open a text file to attach it", cx);
+            return;
+        };
+        let state = doc.editor.read(cx);
+        let range = state.selected_range();
+        let selection = (range.start != range.end).then(|| {
+            let text = state.text();
+            let start = text.offset_to_position(range.start).line + 1;
+            let end = text.offset_to_position(range.end).line + 1;
+            (state.selected_text().to_string(), start, end)
+        });
+        let attachment = Attachment { path: doc.path.clone(), selection };
+        if let Some(agent) = self.agent.clone() {
+            agent.update(cx, |agent, cx| agent.add_attachment(attachment, cx));
+        }
+    }
+
+    fn agent_read(
+        &mut self,
+        path: PathBuf,
+        line: Option<u32>,
+        limit: Option<u32>,
+        reply: crate::agent::client::Reply,
+        cx: &mut Context<Self>,
+    ) {
+        let open = self.docs.iter().find(|d| d.path == path && d.image.is_none()).map(|d| d.editor.read(cx).text().clone());
+        cx.background_spawn(async move {
+            let text = match open {
+                Some(rope) => Ok(rope.to_string()),
+                None => crate::agent::policy::read_text(&path),
+            };
+            reply.read(text.map(|text| crate::agent::policy::slice_lines(&text, line, limit)));
+        })
+        .detach();
+    }
+
+    fn agent_write(
+        &mut self,
+        path: PathBuf,
+        content: String,
+        reply: crate::agent::client::Reply,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self.docs.iter().position(|d| d.path == path) {
+            if self.docs[ix].image.is_some() {
+                reply.written(Err(format!("{} is open as an image", path.display())));
+                return;
+            }
+            let (id, editor) = (self.docs[ix].id, self.docs[ix].editor.clone());
+            let old = editor.read(cx).text().to_string();
+            if old != content {
+                self.docs[ix].ai_hash = Some(document::hash_text(&content));
+                if !Self::replace_minimal(&editor, &old, &content, window, cx) {
+                    reply.written(Err("the file changed while the agent was writing".into()));
+                    return;
+                }
+                let active = self.active == Some(ix);
+                self.docs[ix].ai_unseen = !active;
+                self.save_doc_async(id, cx);
+                self.mark_ai_lines(id, old, content, cx);
+                if active {
+                    self.pulse_glow(&path, cx);
+                }
+            }
+            reply.written(Ok(()));
+            cx.notify();
+            return;
+        }
+        let write = cx.background_spawn(async move {
+            let result = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| files::write_atomic(&path, content.as_bytes()))
+                .map_err(|err| format!("cannot write {}: {err}", path.display()));
+            reply.written(result);
+        });
+        cx.spawn(async move |this, cx| {
+            write.await;
+            let _ = this.update(cx, |this, cx| {
+                this.refresh_tree(cx);
+                this.schedule_git_refresh(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn pulse_glow(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let glow = self.glow.get_or_insert_with(|| cx.new(|_| AgentGlow::new())).clone();
+        glow.update(cx, |glow, cx| glow.note(path, cx));
+        cx.notify();
+    }
+
+    fn mark_ai_lines(&mut self, id: usize, old: String, new: String, cx: &mut Context<Self>) {
+        let lines = cx.background_spawn(async move { crate::agent::diff::changed_lines(&old, &new) });
+        cx.spawn(async move |this, cx| {
+            let lines = lines.await;
+            let _ = this.update(cx, |this, cx| this.apply_ai_marks(id, lines, cx));
+        })
+        .detach();
+    }
+
+    fn apply_ai_marks(&mut self, id: usize, lines: Vec<std::ops::Range<usize>>, cx: &mut Context<Self>) {
+        let Some(ix) = self.doc_ix(id) else { return };
+        let editor = self.docs[ix].editor.clone();
+        let text = editor.read(cx).text().clone();
+        if self.docs[ix].ai_hash != Some(document::hash_text(&text.to_string())) {
+            return;
+        }
+        if let Some(old) = self.docs[ix].ai_marks.take() {
+            old.dispose(cx);
+        }
+        let count = text.lines_len();
+        let decorations: Vec<RangeDecoration> = lines
+            .into_iter()
+            .filter(|range| range.start < count)
+            .map(|range| {
+                let last = range.end.max(range.start + 1).min(count) - 1;
+                let start = text.line_start_offset(range.start);
+                let end = text.line_end_offset(last).max(start);
+                RangeDecoration::new(start..end).with_style(RangeDecorationStyle::Fill).with_color(crate::agent::glow::line_tint())
+            })
+            .collect();
+        if decorations.is_empty() {
+            return;
+        }
+        let marks = editor.update(cx, |state, cx| state.create_range_decorations_collection(decorations, cx));
+        self.docs[ix].ai_marks = Some(marks);
+        cx.notify();
+    }
+
+    fn clear_ai_marks_on_user_edit(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(ix) = self.doc_ix(id) else { return };
+        let Some(expected) = self.docs[ix].ai_hash else { return };
+        let current = document::hash_text(&self.docs[ix].editor.read(cx).text().to_string());
+        if current == expected {
+            return;
+        }
+        self.docs[ix].ai_hash = None;
+        if let Some(marks) = self.docs[ix].ai_marks.take() {
+            marks.dispose(cx);
+        }
+        cx.notify();
+    }
+
+    fn clear_all_ai_marks(&mut self, cx: &mut Context<Self>) {
+        for ix in 0..self.docs.len() {
+            self.docs[ix].ai_hash = None;
+            if let Some(marks) = self.docs[ix].ai_marks.take() {
+                marks.dispose(cx);
+            }
+        }
     }
 }

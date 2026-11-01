@@ -1,15 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use git2::{
-    Branch, ErrorCode, IndexAddOption, Repository, RepositoryState, Sort, Status, StatusOptions,
+    Branch, ErrorCode, IndexAddOption, Repository, RepositoryState, Status, StatusOptions,
     StatusShow, build::CheckoutBuilder,
 };
 
-const LOG_LIMIT: usize = 40;
 
 const COMMIT_HOOKS: [&str; 4] = ["pre-commit", "prepare-commit-msg", "commit-msg", "post-commit"];
 
@@ -43,14 +41,6 @@ pub struct Change {
     pub staged: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct Commit {
-    pub hash: String,
-    pub subject: String,
-    pub author: String,
-    pub when: String,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct RepoState {
     pub workdir: PathBuf,
@@ -59,7 +49,6 @@ pub struct RepoState {
     pub behind: u32,
     pub staged: Vec<Change>,
     pub unstaged: Vec<Change>,
-    pub log: Vec<Commit>,
 }
 
 impl RepoState {
@@ -150,11 +139,6 @@ pub fn read_state(dir: &Path) -> Result<RepoState> {
     }
     state.staged.sort_by(|a, b| a.path.cmp(&b.path));
     state.unstaged.sort_by(|a, b| a.path.cmp(&b.path));
-
-    match read_log(&repo) {
-        Ok(log) => state.log = log,
-        Err(err) => eprintln!("forge: git log failed: {err}"),
-    }
     Ok(state)
 }
 
@@ -218,46 +202,8 @@ fn read_branch(repo: &Repository, state: &mut RepoState) {
     }
 }
 
-fn read_log(repo: &Repository) -> Result<Vec<Commit>> {
-    let mut walk = repo.revwalk()?;
-    if let Err(err) = walk.push_head() {
-        if err.code() == ErrorCode::UnbornBranch || err.code() == ErrorCode::NotFound {
-            return Ok(Vec::new());
-        }
-        return Err(err.into());
-    }
-    walk.set_sorting(Sort::TIME)?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let mut log = Vec::with_capacity(LOG_LIMIT);
-    for oid in walk.take(LOG_LIMIT) {
-        let commit = repo.find_commit(oid?)?;
-        let author = commit.author();
-        log.push(Commit {
-            hash: oid_short(commit.id()),
-            subject: commit.summary().ok().flatten().unwrap_or_default().to_string(),
-            author: author.name().unwrap_or_default().to_string(),
-            when: relative_time(now, commit.time().seconds()),
-        });
-    }
-    Ok(log)
-}
-
 fn oid_short(oid: git2::Oid) -> String {
     oid.to_string()[..7].to_string()
-}
-
-pub fn relative_time(now: i64, then: i64) -> String {
-    let secs = (now - then).max(0);
-    let (n, unit) = match secs {
-        s if s < 60 => return "just now".into(),
-        s if s < 3_600 => (s / 60, "minute"),
-        s if s < 86_400 => (s / 3_600, "hour"),
-        s if s < 86_400 * 14 => (s / 86_400, "day"),
-        s if s < 86_400 * 60 => (s / (86_400 * 7), "week"),
-        s if s < 86_400 * 365 => (s / (86_400 * 30), "month"),
-        s => (s / (86_400 * 365), "year"),
-    };
-    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
 pub fn stage_file(dir: &Path, path: &Path) -> Result<()> {
@@ -461,6 +407,7 @@ pub fn repo_name(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn tree_marks_mark_every_ancestor_dir_and_count_distinct_files() {
@@ -504,14 +451,6 @@ mod tests {
         assert!(clone(&url, &parent).is_err());
         assert!(!marker.exists());
         std::fs::remove_dir_all(&parent).unwrap();
-    }
-
-    #[test]
-    fn relative_time_buckets() {
-        assert_eq!(relative_time(100, 90), "just now");
-        assert_eq!(relative_time(3_600 * 3, 0), "3 hours ago");
-        assert_eq!(relative_time(86_400, 0), "1 day ago");
-        assert_eq!(relative_time(86_400 * 365 * 2, 0), "2 years ago");
     }
 
     struct TempRepo {
@@ -579,9 +518,10 @@ mod tests {
         commit(&t.dir, "initial", true).unwrap();
         let state = t.state();
         assert!(state.staged.is_empty() && state.unstaged.is_empty());
-        assert_eq!(state.log.len(), 1);
-        assert_eq!(state.log[0].subject, "initial");
-        assert_eq!(state.log[0].author, "Forge Test");
+        let repo = Repository::open(&t.dir).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().ok().flatten(), Some("initial"));
+        assert_eq!(head.author().name().ok(), Some("Forge Test"));
 
         t.write("a.txt", "one changed\n");
         t.write("dir/b.txt", "two changed\n");
@@ -596,8 +536,10 @@ mod tests {
         let state = t.state();
         assert!(state.staged.is_empty());
         assert_eq!(paths(&state.unstaged), vec![("dir/b.txt".into(), FileStatus::Modified)]);
-        assert_eq!(state.log[0].subject, "change a");
-        assert_eq!(state.log.len(), 2);
+        let repo = Repository::open(&t.dir).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().ok().flatten(), Some("change a"));
+        assert_eq!(head.parent_count(), 1);
 
         stage_file(&t.dir, Path::new("dir/b.txt")).unwrap();
         t.write("dir/b.txt", "two changed again\n");

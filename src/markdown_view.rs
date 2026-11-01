@@ -21,6 +21,7 @@ use crate::preview_pane::{open_link, resolve_image};
 use crate::theme::{UI_FONT, c, mono_font};
 
 const BASE_SIZE: f32 = 16.;
+const FLOW_SIZE: f32 = 13.;
 const CODE_SIZE: f32 = BASE_SIZE * 0.85;
 const MAX_WIDTH: f32 = 980.;
 const WIDE_PANE: f32 = 768.;
@@ -225,6 +226,7 @@ pub struct MarkdownView {
     copied: Option<SharedString>,
     copied_task: Option<Task<()>>,
     padding: f32,
+    flow: bool,
 }
 
 impl MarkdownView {
@@ -238,7 +240,12 @@ impl MarkdownView {
             copied: None,
             copied_task: None,
             padding: PAD_NARROW,
+            flow: false,
         }
+    }
+
+    pub fn flow(base: Arc<Path>) -> Self {
+        MarkdownView { padding: 0., flow: true, ..MarkdownView::new(base) }
     }
 
     pub fn set_document(&mut self, doc: Document, cx: &mut Context<Self>) {
@@ -763,7 +770,21 @@ fn checkbox(checked: bool, gh: Gh) -> AnyElement {
 }
 
 impl Render for MarkdownView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.flow {
+            let gh = Gh::new(is_dark(cx));
+            let items: Vec<AnyElement> = (0..self.doc.blocks.len()).map(|ix| self.render_item(ix, window, cx)).collect();
+            return div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .text_color(gh.fg)
+                .font_family(UI_FONT)
+                .text_size(px(FLOW_SIZE))
+                .line_height(relative(1.5))
+                .children(items)
+                .into_any_element();
+        }
         self.padding = article_padding(f32::from(self.list.viewport_bounds().size.width));
         let gh = Gh::new(is_dark(cx));
         div()
@@ -776,6 +797,7 @@ impl Render for MarkdownView {
             .line_height(relative(1.5))
             .child(list(self.list.clone(), cx.processor(Self::render_item)).size_full())
             .child(Scrollbar::vertical(&self.list))
+            .into_any_element()
     }
 }
 
